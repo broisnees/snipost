@@ -79,54 +79,131 @@ struct EditorView: View {
                                             ))
                                         }
                                 )
+                                .overlay(selectionOverlay(in: geo.size))
                         }
                     )
                     .padding(28)
+                    // Focus lets ⌫ reach the selected markup; the sidebar keeps
+                    // a visible Delete for anyone who never clicks the preview.
+                    .focusable()
+                    .onKeyPress(.delete) {
+                        guard model.selection != nil else { return .ignored }
+                        model.deleteSelection()
+                        return .handled
+                    }
+                    .onKeyPress(.escape) {
+                        guard model.selection != nil else { return .ignored }
+                        model.selection = nil
+                        return .handled
+                    }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Marching-ants box with corner handles around the selected markup. Drawn
+    /// over the preview rather than into the image, so it never exports.
+    private func selectionOverlay(in size: CGSize) -> some View {
+        Canvas { context, _ in
+            guard let box = model.selectionBox else { return }
+            let rect = CGRect(
+                x: box.minX * size.width,
+                y: box.minY * size.height,
+                width: box.width * size.width,
+                height: box.height * size.height
+            ).insetBy(dx: -2, dy: -2)
+            let path = Path(roundedRect: rect, cornerRadius: 3)
+            // Two offset dashes stay visible on light and dark content alike.
+            context.stroke(path, with: .color(.black.opacity(0.65)), style: StrokeStyle(lineWidth: 1.5, dash: [4, 4]))
+            context.stroke(path, with: .color(.white), style: StrokeStyle(lineWidth: 1.5, dash: [4, 4], dashPhase: 4))
+
+            for corner in [
+                CGPoint(x: rect.minX, y: rect.minY),
+                CGPoint(x: rect.maxX, y: rect.minY),
+                CGPoint(x: rect.minX, y: rect.maxY),
+                CGPoint(x: rect.maxX, y: rect.maxY),
+            ] {
+                let handle = Path(ellipseIn: CGRect(x: corner.x - 3.5, y: corner.y - 3.5, width: 7, height: 7))
+                context.fill(handle, with: .color(.white))
+                context.stroke(handle, with: .color(.black.opacity(0.5)), lineWidth: 1)
+            }
+        }
+        .allowsHitTesting(false)
     }
 
     // MARK: Sections
 
     private var annotateSection: some View {
         section("Annotate") {
-            HStack(spacing: 6) {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 5), count: 7), spacing: 5) {
                 ForEach(AnnotationTool.allCases) { tool in
-                    iconButton(
-                        symbol: tool.symbolName,
-                        isSelected: model.tool == tool,
-                        help: tool.rawValue
-                    ) { model.tool = tool }
+                    toolButton(tool)
                 }
             }
-            if model.tool != .move {
-                HStack(spacing: 8) {
-                    ForEach(Array(Annotation.palette.enumerated()), id: \.offset) { index, rgb in
-                        colorDot(rgb, isSelected: model.annotationColorIndex == index) {
-                            model.annotationColorIndex = index
-                        }
+
+            HStack(spacing: 6) {
+                ForEach(Array(Annotation.palette.enumerated()), id: \.offset) { index, rgb in
+                    colorDot(rgb, isSelected: model.annotationColorIndex == index) {
+                        model.annotationColorIndex = index
+                        model.restyleSelection()
                     }
-                    Spacer()
-                    Button("Undo") { model.undoAnnotation() }
-                        .controlSize(.small)
-                        .disabled(model.annotations.isEmpty)
-                    Button("Clear") { model.clearAnnotations() }
-                        .controlSize(.small)
-                        .disabled(model.annotations.isEmpty)
                 }
-                if model.tool == .text, let binding = model.lastTextBinding {
-                    TextField("Text", text: binding)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 13))
-                }
-                Text(model.tool == .text
-                    ? "Click the preview to place text, then edit it above"
-                    : "Drag on the preview to draw")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
             }
+
+            HStack(spacing: 8) {
+                Text("Weight")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Slider(value: $model.annotationWeight, in: 0.5...3) { editing in
+                    if !editing { model.restyleSelection() }
+                }
+            }
+
+            HStack(spacing: 6) {
+                Button("Undo") { model.undo() }
+                    .controlSize(.small)
+                    .disabled(!model.canUndo)
+                    .keyboardShortcut("z", modifiers: .command)
+                Button("Redo") { model.redo() }
+                    .controlSize(.small)
+                    .disabled(!model.canRedo)
+                    .keyboardShortcut("z", modifiers: [.command, .shift])
+                Spacer()
+                Button("Delete") { model.deleteSelection() }
+                    .controlSize(.small)
+                    .disabled(model.selection == nil)
+                Button("Clear") { model.clearAnnotations() }
+                    .controlSize(.small)
+                    .disabled(model.annotations.isEmpty)
+            }
+
+            if let binding = model.lastTextBinding, model.tool == .text || model.selection != nil {
+                TextField("Text", text: binding)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 13))
+            }
+
+            Text(model.tool.hint)
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
         }
+    }
+
+    private func toolButton(_ tool: AnnotationTool) -> some View {
+        let isSelected = model.tool == tool
+        return Button { model.tool = tool } label: {
+            Image(systemName: tool.symbolName)
+                .font(.system(size: 12, weight: .medium))
+                .frame(maxWidth: .infinity, minHeight: 28)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(isSelected ? Color.accentColor : Color.primary.opacity(0.06))
+                )
+                .foregroundStyle(isSelected ? Color.white : Color.primary)
+                .contentShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(PressableButtonStyle())
+        .help(tool.rawValue)
     }
 
     private var backgroundSection: some View {

@@ -22,12 +22,23 @@ final class EditorModel: ObservableObject {
     @Published var lastSaveMessage: String?
 
     // Annotations
-    @Published var tool: AnnotationTool = .move
+    @Published var tool: AnnotationTool = .move {
+        didSet { if tool != .move { selection = nil } }
+    }
     @Published var annotations: [Annotation] = [] {
         didSet { rebuildComposition(); renderPreview() }
     }
     @Published var annotationColorIndex = 0
+    @Published var annotationWeight: CGFloat = 1
+    /// The markup the Select tool has picked up, if any.
+    @Published var selection: UUID?
+    @Published private var undoStack: [[Annotation]] = []
+    @Published private var redoStack: [[Annotation]] = []
     private var draft: Annotation?
+    /// Where a move drag started, and the annotation as it was at that moment —
+    /// translating from the original each time keeps the drag from drifting.
+    private var dragOrigin: CGPoint?
+    private var movingBase: Annotation?
 
     // Custom background colors
     @Published var customSolid: Color = Color(red: 0.35, green: 0.45, blue: 0.85)
@@ -104,67 +115,217 @@ final class EditorModel: ObservableObject {
     // MARK: Preview interaction (cursor placement or annotation drawing)
 
     func dragChanged(atNormalized point: CGPoint) {
-        switch tool {
-        case .move:
-            placeCursor(atNormalized: point)
-        case .arrow, .box, .blur:
-            let imagePoint = imagePoint(fromCanvasNormalized: point)
+        let imagePoint = self.imagePoint(fromCanvasNormalized: point)
+        switch tool.input {
+        case .none:
+            moveOrSelect(at: imagePoint, normalized: point)
+
+        case .segment, .region:
             if draft == nil {
-                draft = Annotation(tool: tool, start: imagePoint, end: imagePoint, color: currentColor)
+                draft = Annotation(
+                    tool: tool, start: imagePoint, end: imagePoint,
+                    color: currentColor, weight: annotationWeight
+                )
             } else {
                 draft?.end = imagePoint
             }
             rebuildComposition()
             renderPreview()
-        case .text:
+
+        case .stroke:
+            if draft == nil {
+                draft = Annotation(
+                    tool: tool, start: imagePoint, end: imagePoint, points: [imagePoint],
+                    color: currentColor, weight: annotationWeight
+                )
+            } else if let last = draft?.points.last,
+                      hypot(imagePoint.x - last.x, imagePoint.y - last.y) > strokeSampleSpacing {
+                // Thinning the samples keeps a long stroke from recompositing
+                // the whole image on every pointer move.
+                draft?.points.append(imagePoint)
+                draft?.end = imagePoint
+            } else {
+                return
+            }
+            rebuildComposition()
+            renderPreview()
+
+        case .point:
             break // placed on release
         }
     }
 
     func dragEnded(atNormalized point: CGPoint) {
-        switch tool {
-        case .move:
-            break
-        case .arrow, .box, .blur:
-            if var finished = draft {
-                finished.end = imagePoint(fromCanvasNormalized: point)
-                draft = nil
-                let span = hypot(finished.end.x - finished.start.x, finished.end.y - finished.start.y)
-                if span > 6 {
-                    annotations.append(finished)
-                } else {
-                    rebuildComposition()
-                    renderPreview()
-                }
+        let imagePoint = self.imagePoint(fromCanvasNormalized: point)
+        switch tool.input {
+        case .none:
+            dragOrigin = nil
+            movingBase = nil
+
+        case .segment, .region:
+            guard var finished = draft else { break }
+            draft = nil
+            finished.end = imagePoint
+            let span = hypot(finished.end.x - finished.start.x, finished.end.y - finished.start.y)
+            if span > 6 {
+                commit(finished)
+            } else {
+                rebuildComposition()
+                renderPreview()
             }
-        case .text:
-            let imagePoint = imagePoint(fromCanvasNormalized: point)
-            annotations.append(Annotation(
-                tool: .text,
+
+        case .stroke:
+            guard var finished = draft else { break }
+            draft = nil
+            finished.points.append(imagePoint)
+            finished.end = imagePoint
+            if finished.points.count > 2 {
+                commit(finished)
+            } else {
+                rebuildComposition()
+                renderPreview()
+            }
+
+        case .point:
+            let placed = Annotation(
+                tool: tool,
                 start: imagePoint,
                 end: imagePoint,
-                text: "Text",
-                color: currentColor
-            ))
+                text: tool == .text ? "Text" : "",
+                color: currentColor,
+                weight: annotationWeight,
+                stepNumber: nextStepNumber
+            )
+            commit(placed)
         }
+    }
+
+    /// How far the pointer must travel, in source pixels, before a freehand
+    /// stroke records another point.
+    private var strokeSampleSpacing: CGFloat {
+        max(2, CGFloat(min(source.width, source.height)) * 0.003)
+    }
+
+    private var nextStepNumber: Int {
+        (annotations.filter { $0.tool == .step }.map(\.stepNumber).max() ?? 0) + 1
+    }
+
+    private func commit(_ annotation: Annotation) {
+        checkpoint()
+        annotations.append(annotation)
+        selection = annotation.id
+    }
+
+    // MARK: Selecting and moving markup
+
+    private func moveOrSelect(at imagePoint: CGPoint, normalized: CGPoint) {
+        if let base = movingBase, let origin = dragOrigin {
+            let delta = CGSize(width: imagePoint.x - origin.x, height: imagePoint.y - origin.y)
+            if let index = annotations.firstIndex(where: { $0.id == base.id }) {
+                annotations[index] = base.translated(by: delta)
+            }
+            return
+        }
+        if let hit = annotation(at: imagePoint) {
+            selection = hit.id
+            movingBase = hit
+            dragOrigin = imagePoint
+            checkpoint()
+            return
+        }
+        selection = nil
+        // Nothing under the pointer — fall through to dragging the cursor
+        // overlay, which is the other thing this tool does.
+        if settings.cursor != .none {
+            placeCursor(atNormalized: normalized)
+        }
+    }
+
+    /// Topmost markup under a point, with a little slop so thin strokes are
+    /// still catchable.
+    private func annotation(at point: CGPoint) -> Annotation? {
+        let minSide = CGFloat(min(source.width, source.height))
+        let slop = minSide * 0.008
+        return annotations.reversed().first {
+            $0.bounds(minSide: minSide).insetBy(dx: -slop, dy: -slop).contains(point)
+        }
+    }
+
+    /// The selected markup's box, normalized over the output canvas with y from
+    /// the top, so the view can outline it on the preview.
+    var selectionBox: CGRect? {
+        guard let selection,
+              let annotation = annotations.first(where: { $0.id == selection })
+        else { return nil }
+        let minSide = CGFloat(min(source.width, source.height))
+        return normalizedCanvasRect(fromImage: annotation.bounds(minSide: minSide))
+    }
+
+    func deleteSelection() {
+        guard let selection, let index = annotations.firstIndex(where: { $0.id == selection }) else { return }
+        checkpoint()
+        annotations.remove(at: index)
+        self.selection = nil
     }
 
     var currentColor: RGB {
         Annotation.palette[min(annotationColorIndex, Annotation.palette.count - 1)]
     }
 
-    func undoAnnotation() {
-        guard !annotations.isEmpty else { return }
-        annotations.removeLast()
+    /// Recolours or reweights the selection instead of only affecting what is
+    /// drawn next — otherwise picking a colour with something selected does
+    /// nothing visible and reads as broken.
+    func restyleSelection() {
+        guard let selection, let index = annotations.firstIndex(where: { $0.id == selection }) else { return }
+        checkpoint()
+        annotations[index].color = currentColor
+        annotations[index].weight = annotationWeight
+    }
+
+    // MARK: Undo
+
+    private func checkpoint() {
+        undoStack.append(annotations)
+        if undoStack.count > 60 { undoStack.removeFirst() }
+        redoStack.removeAll()
+    }
+
+    var canUndo: Bool { !undoStack.isEmpty }
+    var canRedo: Bool { !redoStack.isEmpty }
+
+    func undo() {
+        guard let previous = undoStack.popLast() else { return }
+        redoStack.append(annotations)
+        annotations = previous
+        pruneSelection()
+    }
+
+    func redo() {
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(annotations)
+        annotations = next
+        pruneSelection()
+    }
+
+    private func pruneSelection() {
+        if let selection, !annotations.contains(where: { $0.id == selection }) {
+            self.selection = nil
+        }
     }
 
     func clearAnnotations() {
+        guard !annotations.isEmpty else { return }
+        checkpoint()
         annotations.removeAll()
+        selection = nil
     }
 
-    /// Binding to the most recent text annotation, for inline editing.
+    /// Binding to the selected text markup, or the most recent one.
     var lastTextBinding: Binding<String>? {
-        guard let index = annotations.lastIndex(where: { $0.tool == .text }) else { return nil }
+        let selected = selection.flatMap { id in
+            annotations.firstIndex { $0.id == id && $0.tool == .text }
+        }
+        guard let index = selected ?? annotations.lastIndex(where: { $0.tool == .text }) else { return nil }
         return Binding(
             get: { [weak self] in self?.annotations[index].text ?? "" },
             set: { [weak self] newValue in
@@ -174,9 +335,9 @@ final class EditorModel: ObservableObject {
         )
     }
 
-    /// Maps a normalized canvas point (y from top) into source-image pixels,
-    /// mirroring the renderer's layout math.
-    private func imagePoint(fromCanvasNormalized p: CGPoint) -> CGPoint {
+    /// Where the screenshot sits inside the output canvas, mirroring the
+    /// renderer's layout math. Both mappings below are built on it.
+    private func layout() -> (canvas: CGSize, origin: CGPoint, image: CGSize) {
         let iw = CGFloat(source.width)
         let ih = CGFloat(source.height)
         let padding = settings.paddingFraction * max(iw, ih)
@@ -185,11 +346,30 @@ final class EditorModel: ObservableObject {
         if let ratio = settings.aspect.ratio {
             if cw / ch < ratio { cw = ch * ratio } else { ch = cw / ratio }
         }
-        let originX = (cw - iw) / 2
-        let originY = (ch - ih) / 2
+        return (
+            CGSize(width: cw, height: ch),
+            CGPoint(x: (cw - iw) / 2, y: (ch - ih) / 2),
+            CGSize(width: iw, height: ih)
+        )
+    }
+
+    /// Maps a normalized canvas point (y from top) into source-image pixels.
+    private func imagePoint(fromCanvasNormalized p: CGPoint) -> CGPoint {
+        let (canvas, origin, image) = layout()
         return CGPoint(
-            x: min(max(p.x * cw - originX, 0), iw),
-            y: min(max(p.y * ch - originY, 0), ih)
+            x: min(max(p.x * canvas.width - origin.x, 0), image.width),
+            y: min(max(p.y * canvas.height - origin.y, 0), image.height)
+        )
+    }
+
+    /// The inverse, for drawing overlays on the preview.
+    private func normalizedCanvasRect(fromImage rect: CGRect) -> CGRect {
+        let (canvas, origin, _) = layout()
+        return CGRect(
+            x: (rect.minX + origin.x) / canvas.width,
+            y: (rect.minY + origin.y) / canvas.height,
+            width: rect.width / canvas.width,
+            height: rect.height / canvas.height
         )
     }
 
