@@ -224,11 +224,23 @@ final class EditorModel: ObservableObject {
             draft = nil
             finished.end = imagePoint
             let span = hypot(finished.end.x - finished.start.x, finished.end.y - finished.start.y)
-            if span > 6 {
-                commit(finished)
-            } else {
+            guard span > 6 else {
                 rebuildComposition()
                 renderPreview()
+                break
+            }
+            if finished.tool == .hideText {
+                // Drop the region itself and pixelate the words inside it.
+                rebuildComposition()
+                renderPreview()
+                hideText(in: CGRect(
+                    x: min(finished.start.x, finished.end.x),
+                    y: min(finished.start.y, finished.end.y),
+                    width: abs(finished.start.x - finished.end.x),
+                    height: abs(finished.start.y - finished.end.y)
+                ))
+            } else {
+                commit(finished)
             }
 
         case .stroke:
@@ -436,6 +448,63 @@ final class EditorModel: ObservableObject {
         guard let combined = ImageOps.stacked([source, image], axis: axis, gap: 0) else { return }
         checkpoint()
         adopt(combined)
+    }
+
+    // MARK: Hiding text, pasting images
+
+    /// Pixelates each line of text inside the region and nothing else, so a
+    /// redaction doesn't have to swallow the surrounding layout.
+    private func hideText(in region: CGRect) {
+        let rect = region.integral.intersection(sourceBounds)
+        guard rect.width > 8, rect.height > 8, let patch = source.cropping(to: rect) else { return }
+        flashSaveMessage("Looking for text…")
+        Task { @MainActor in
+            let boxes = await TextRecognizer.textBoxes(in: patch)
+            let placed: [Annotation] = boxes.compactMap { box in
+                let shifted = box.offsetBy(dx: rect.minX, dy: rect.minY).intersection(sourceBounds)
+                guard shifted.width > 2, shifted.height > 2 else { return nil }
+                return Annotation(
+                    tool: .pixelate,
+                    start: CGPoint(x: shifted.minX, y: shifted.minY),
+                    end: CGPoint(x: shifted.maxX, y: shifted.maxY),
+                    color: currentColor,
+                    weight: annotationWeight
+                )
+            }
+            guard !placed.isEmpty else {
+                flashSaveMessage("No text found there")
+                return
+            }
+            checkpoint()
+            // One assignment, so the image is recomposited once and not per line.
+            annotations += placed
+            flashSaveMessage("Hid \(placed.count) line\(placed.count == 1 ? "" : "s") of text")
+        }
+    }
+
+    /// Drops the clipboard's image onto the capture as a movable overlay.
+    func pasteImageOverlay() {
+        guard let overlay = Clipboard.image() else {
+            flashSaveMessage("No image on the clipboard")
+            return
+        }
+        let width = CGFloat(source.width) * 0.4
+        let height = width * CGFloat(overlay.height) / CGFloat(max(overlay.width, 1))
+        let origin = CGPoint(
+            x: (CGFloat(source.width) - width) / 2,
+            y: (CGFloat(source.height) - height) / 2
+        )
+        let annotation = Annotation(
+            tool: .image,
+            start: origin,
+            end: CGPoint(x: origin.x + width, y: origin.y + height),
+            color: currentColor,
+            image: overlay
+        )
+        commit(annotation)
+        // Land on the Select tool so it can be dragged into place at once.
+        tool = .move
+        selection = annotation.id
     }
 
     // MARK: Pixel loupe and colour picker
@@ -663,13 +732,17 @@ final class EditorModel: ObservableObject {
         }
     }
 
-    func saveToDesktop() {
+    var saveFolderName: String { Preferences.shared.saveFolderName }
+
+    func saveToFolder() {
         guard let full = renderFull() else { return }
-        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        let url = desktop.appendingPathComponent(defaultFilename())
+        let folder = Preferences.shared.saveFolder
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let url = folder.appendingPathComponent(defaultFilename())
         if ImageWriter.write(full, to: url.path, format: settings.exportFormat) {
-            flashSaveMessage("Saved to Desktop")
+            flashSaveMessage("Saved to \(folder.lastPathComponent)")
+        } else {
+            flashSaveMessage("Could not write to \(folder.lastPathComponent)")
         }
     }
 
@@ -716,18 +789,27 @@ final class EditorModel: ObservableObject {
         }
     }
 
-    /// OCR via Vision: recognized text from the original capture → clipboard.
+    /// OCR via Vision: recognized text — and any QR or barcode payload — from
+    /// the original capture → clipboard.
     func copyRecognizedText() {
         let image = source
         flashSaveMessage("Recognizing text…")
         Task { @MainActor in
             let text = await TextRecognizer.recognize(in: image)
-            if text.isEmpty {
+            let codes = await TextRecognizer.codes(in: image)
+            // A code is usually the point of the shot when there is one, so it
+            // goes first.
+            let combined = (codes + (text.isEmpty ? [] : [text])).joined(separator: "\n")
+            guard !combined.isEmpty else {
                 flashSaveMessage("No text found")
+                return
+            }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(combined, forType: .string)
+            if codes.isEmpty {
+                flashSaveMessage("Text copied (\(combined.count) chars)")
             } else {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(text, forType: .string)
-                flashSaveMessage("Text copied (\(text.count) chars)")
+                flashSaveMessage("Copied \(codes.count) code\(codes.count == 1 ? "" : "s")\(text.isEmpty ? "" : " + text")")
             }
         }
     }

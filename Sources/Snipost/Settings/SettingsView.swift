@@ -33,7 +33,21 @@ private struct GeneralSettingsTab: View {
                     }
                 }
                 Toggle("Copy beautified image to clipboard", isOn: $prefs.autoCopy)
-                Toggle("Save to Desktop automatically", isOn: $prefs.autoSaveToDesktop)
+                Toggle("Save every capture automatically", isOn: $prefs.autoSaveToDesktop)
+                HStack {
+                    Text("Save folder")
+                    Spacer()
+                    Text(prefs.saveFolderName)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Button("Choose…") { chooseSaveFolder() }
+                        .controlSize(.small)
+                    if !prefs.saveFolderPath.isEmpty {
+                        Button("Desktop") { prefs.saveFolderPath = "" }
+                            .controlSize(.small)
+                    }
+                }
                 Toggle("Keep capture history", isOn: $prefs.saveHistory)
                 Toggle("Include the mouse pointer (live position and shape)", isOn: $prefs.includeCursor)
                 Text(flowCaption)
@@ -42,6 +56,18 @@ private struct GeneralSettingsTab: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private func chooseSaveFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = prefs.saveFolder
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        prefs.saveFolderPath = url.path
     }
 
     private var flowCaption: String {

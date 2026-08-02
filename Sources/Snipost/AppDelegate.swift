@@ -201,9 +201,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func saveToDesktop(_ rendered: CGImage) {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        let url = desktop.appendingPathComponent("Snipost \(formatter.string(from: Date())).png")
+        let folder = Preferences.shared.saveFolder
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let url = folder.appendingPathComponent("Snipost \(formatter.string(from: Date())).png")
         _ = ImageWriter.write(rendered, to: url.path)
     }
 

@@ -232,7 +232,7 @@ struct EditorView: View {
     private var annotateSection: some View {
         section("Annotate") {
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 5), count: 7), spacing: 5) {
-                ForEach(AnnotationTool.allCases) { tool in
+                ForEach(AnnotationTool.drawable) { tool in
                     toolButton(tool)
                 }
             }
@@ -368,6 +368,18 @@ struct EditorView: View {
                     }
                     .controlSize(.small)
                 }
+            }
+
+            HStack(spacing: 6) {
+                Button {
+                    model.pasteImageOverlay()
+                } label: {
+                    Label("Paste over", systemImage: "photo.badge.plus")
+                        .frame(maxWidth: .infinity)
+                }
+                .controlSize(.small)
+                .keyboardShortcut("v", modifiers: .command)
+                .help("Drop the clipboard's image on top as a movable overlay")
             }
 
             HStack(spacing: 6) {
@@ -599,7 +611,7 @@ struct EditorView: View {
             .keyboardShortcut("c", modifiers: .command)
 
             HStack(spacing: 8) {
-                Button("Save to Desktop") { model.saveToDesktop() }
+                Button("Save to \(model.saveFolderName)") { model.saveToFolder() }
                     .frame(maxWidth: .infinity)
                 Button("Save…") { model.saveAs() }
                     .frame(maxWidth: .infinity)

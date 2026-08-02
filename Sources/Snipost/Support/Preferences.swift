@@ -71,6 +71,10 @@ final class Preferences: ObservableObject {
     @Published var includeCursor: Bool {
         didSet { defaults.set(includeCursor, forKey: "includeCursor") }
     }
+    /// Where cmd-S and auto-save put files. Empty means the Desktop.
+    @Published var saveFolderPath: String {
+        didSet { defaults.set(saveFolderPath, forKey: "saveFolderPath") }
+    }
     @Published var autoUploadToDrive: Bool {
         didSet { defaults.set(autoUploadToDrive, forKey: "autoUploadToDrive") }
     }
@@ -110,6 +114,7 @@ final class Preferences: ObservableObject {
         autoSaveToDesktop = defaults.object(forKey: "autoSaveToDesktop") as? Bool ?? false
         saveHistory = defaults.object(forKey: "saveHistory") as? Bool ?? true
         includeCursor = defaults.object(forKey: "includeCursor") as? Bool ?? true
+        saveFolderPath = defaults.string(forKey: "saveFolderPath") ?? ""
         autoUploadToDrive = defaults.object(forKey: "autoUploadToDrive") as? Bool ?? false
         notifyOnDriveUpload = defaults.object(forKey: "notifyOnDriveUpload") as? Bool ?? true
 
@@ -120,6 +125,19 @@ final class Preferences: ObservableObject {
             }
         }
         hotkeys = loaded
+    }
+
+    /// The folder captures are written to, falling back to the Desktop.
+    var saveFolder: URL {
+        if !saveFolderPath.isEmpty {
+            return URL(fileURLWithPath: saveFolderPath, isDirectory: true)
+        }
+        return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    var saveFolderName: String {
+        saveFolder.lastPathComponent
     }
 
     func hotkey(for action: HotkeyAction) -> Hotkey {

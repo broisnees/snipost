@@ -15,9 +15,19 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
     case blur = "Blur"
     case pixelate = "Pixelate"
     case redact = "Redact"
+    case hideText = "Hide text"
+    case erase = "Erase"
+    case measure = "Measure"
     case spotlight = "Spotlight"
+    /// Only ever created by pasting, so it is not in the palette.
+    case image = "Image"
 
     var id: String { rawValue }
+
+    /// The palette: everything you can pick and draw with.
+    static var drawable: [AnnotationTool] {
+        allCases.filter { $0 != .image }
+    }
 
     var symbolName: String {
         switch self {
@@ -33,7 +43,11 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
         case .blur: return "drop"
         case .pixelate: return "square.grid.3x3"
         case .redact: return "rectangle.fill"
+        case .hideText: return "text.badge.xmark"
+        case .erase: return "eraser"
+        case .measure: return "ruler"
         case .spotlight: return "flashlight.on.fill"
+        case .image: return "photo"
         }
     }
 
@@ -49,8 +63,9 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
     var input: Input {
         switch self {
         case .move: return .none
-        case .arrow, .line: return .segment
-        case .box, .ellipse, .blur, .pixelate, .redact, .spotlight: return .region
+        case .arrow, .line, .measure: return .segment
+        case .box, .ellipse, .blur, .pixelate, .redact, .hideText, .erase, .spotlight: return .region
+        case .image: return .none
         case .pen, .highlight: return .stroke
         case .text, .step: return .point
         }
@@ -63,6 +78,10 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
         case .step: return "Click to drop the next numbered badge"
         case .pen, .highlight: return "Draw on the preview"
         case .spotlight: return "Drag the area to keep bright"
+        case .hideText: return "Drag over text to hide only the words"
+        case .erase: return "Drag over something to wipe it out with the colour around it"
+        case .measure: return "Drag to measure, in pixels of the capture"
+        case .image: return "Drag the pasted image to place it"
         default: return "Drag on the preview to draw"
         }
     }
@@ -83,6 +102,8 @@ struct Annotation: Identifiable, Equatable {
     /// the image's own dimensions, so markup scales with the screenshot.
     var weight: CGFloat
     var stepNumber: Int
+    /// Set only for `.image` overlays.
+    var image: CGImage?
 
     init(
         tool: AnnotationTool,
@@ -92,7 +113,8 @@ struct Annotation: Identifiable, Equatable {
         text: String = "",
         color: RGB,
         weight: CGFloat = 1,
-        stepNumber: Int = 1
+        stepNumber: Int = 1,
+        image: CGImage? = nil
     ) {
         self.id = UUID()
         self.tool = tool
@@ -103,6 +125,22 @@ struct Annotation: Identifiable, Equatable {
         self.color = color
         self.weight = weight
         self.stepNumber = stepNumber
+        self.image = image
+    }
+
+    /// Hand-written because CGImage is not Equatable; identity is the right
+    /// comparison for one anyway.
+    static func == (lhs: Annotation, rhs: Annotation) -> Bool {
+        lhs.id == rhs.id
+            && lhs.tool == rhs.tool
+            && lhs.start == rhs.start
+            && lhs.end == rhs.end
+            && lhs.points == rhs.points
+            && lhs.text == rhs.text
+            && lhs.color == rhs.color
+            && lhs.weight == rhs.weight
+            && lhs.stepNumber == rhs.stepNumber
+            && lhs.image === rhs.image
     }
 
     static let palette: [RGB] = [
@@ -142,6 +180,7 @@ struct Annotation: Identifiable, Equatable {
                 width: abs(start.x - end.x),
                 height: abs(start.y - end.y)
             )
+            guard tool != .image else { return AnnotationRenderer.scaled(box, by: weight) }
             let pad = AnnotationRenderer.strokeWidth(weight: weight, minSide: minSide)
             return box.insetBy(dx: -pad, dy: -pad)
         }
@@ -382,6 +421,100 @@ enum AnnotationRenderer {
             ctx.setFillColor(color)
             ctx.fill(rect)
 
+        case .erase:
+            let rect = normalizedRect(start, end)
+            guard rect.width > 2, rect.height > 2 else { break }
+            let topDownRect = normalizedRect(a.start, a.end).integral
+            guard let fill = surroundingColor(of: base, around: topDownRect) else {
+                // Nothing to sample from — leave the pixels alone rather than
+                // painting a guessed colour over them.
+                break
+            }
+            ctx.setFillColor(fill)
+            ctx.fill(rect)
+
+        case .measure:
+            let distance = hypot(a.end.x - a.start.x, a.end.y - a.start.y)
+            guard distance > 4 else { break }
+            ctx.saveGState()
+            dropShadow(in: ctx, lineWidth: lineWidth)
+            ctx.setStrokeColor(color)
+            ctx.setLineWidth(lineWidth)
+            ctx.setLineCap(.butt)
+            ctx.move(to: start)
+            ctx.addLine(to: end)
+            ctx.strokePath()
+
+            // End ticks, square to the line, so it reads as a dimension.
+            let angle = atan2(end.y - start.y, end.x - start.x)
+            let tick = lineWidth * 3
+            for point in [start, end] {
+                ctx.move(to: CGPoint(
+                    x: point.x - cos(angle + .pi / 2) * tick,
+                    y: point.y - sin(angle + .pi / 2) * tick
+                ))
+                ctx.addLine(to: CGPoint(
+                    x: point.x + cos(angle + .pi / 2) * tick,
+                    y: point.y + sin(angle + .pi / 2) * tick
+                ))
+            }
+            ctx.strokePath()
+            ctx.restoreGState()
+
+            // Measurements are in capture pixels — the number people want when
+            // they are checking a layout.
+            let label = "\(Int(distance.rounded())) px"
+            let size = fontSize(weight: a.weight, minSide: minSide) * 0.6
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: size, weight: .semibold),
+                .foregroundColor: NSColor.white,
+            ]
+            let string = NSAttributedString(string: label, attributes: attributes)
+            let textSize = string.size()
+            let padding = size * 0.35
+            let plate = CGRect(
+                x: (start.x + end.x) / 2 - textSize.width / 2 - padding,
+                y: (start.y + end.y) / 2 - textSize.height / 2 - padding * 0.6,
+                width: textSize.width + padding * 2,
+                height: textSize.height + padding * 1.2
+            )
+            ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0.72))
+            ctx.addPath(CGPath(roundedRect: plate, cornerWidth: plate.height / 2, cornerHeight: plate.height / 2, transform: nil))
+            ctx.fillPath()
+
+            let measureContext = NSGraphicsContext(cgContext: ctx, flipped: false)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = measureContext
+            string.draw(at: NSPoint(x: plate.minX + padding, y: plate.minY + padding * 0.6))
+            NSGraphicsContext.restoreGraphicsState()
+
+        case .hideText:
+            // Only ever drawn mid-drag: on release it becomes one pixelation
+            // per line of text found, and this annotation is discarded.
+            let rect = normalizedRect(start, end)
+            ctx.saveGState()
+            ctx.setFillColor(CGColor(red: a.color.r, green: a.color.g, blue: a.color.b, alpha: 0.18))
+            ctx.fill(rect)
+            ctx.setStrokeColor(color)
+            ctx.setLineWidth(lineWidth * 0.6)
+            ctx.setLineDash(phase: 0, lengths: [lineWidth * 2, lineWidth * 2])
+            ctx.stroke(rect)
+            ctx.restoreGState()
+
+        case .image:
+            guard let overlay = a.image else { break }
+            let rect = scaled(normalizedRect(start, end), by: a.weight)
+            guard rect.width > 2, rect.height > 2 else { break }
+            ctx.saveGState()
+            ctx.setShadow(
+                offset: CGSize(width: 0, height: -rect.height * 0.02),
+                blur: rect.height * 0.05,
+                color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.35)
+            )
+            ctx.interpolationQuality = .high
+            ctx.draw(overlay, in: rect)
+            ctx.restoreGState()
+
         case .spotlight:
             let rect = normalizedRect(start, end)
             guard rect.width > 8, rect.height > 8 else { break }
@@ -412,6 +545,62 @@ enum AnnotationRenderer {
         )
     }
 
+    /// Median colour of a thin ring just outside `rect`, in top-down image
+    /// coordinates. On the flat backgrounds UI screenshots are mostly made of,
+    /// filling with it reads as "nothing was ever here"; over busy photography
+    /// it is only ever a solid patch, which is the honest limit of doing this
+    /// without a real inpainting model.
+    ///
+    /// Median, not mean, so one high-contrast neighbour (a border, a caret)
+    /// can't drag the fill away from the background it is meant to match.
+    private static func surroundingColor(of base: CGImage, around rect: CGRect) -> CGColor? {
+        let bounds = CGRect(x: 0, y: 0, width: base.width, height: base.height)
+        let ring = max(2, min(rect.width, rect.height) * 0.08)
+        let outer = rect.insetBy(dx: -ring, dy: -ring).integral.intersection(bounds)
+        guard outer.width > 2, outer.height > 2,
+              let patch = base.cropping(to: outer),
+              let pixels = PixelMap(patch, width: patch.width, height: patch.height)
+        else { return nil }
+
+        let inner = rect.offsetBy(dx: -outer.minX, dy: -outer.minY)
+        var reds: [CGFloat] = []
+        var greens: [CGFloat] = []
+        var blues: [CGFloat] = []
+        // Sample at most ~40 rows and columns; a thousand samples is plenty for
+        // a median and keeps a live slider drag responsive.
+        let stepX = max(1, pixels.width / 40)
+        let stepY = max(1, pixels.height / 40)
+        for y in stride(from: 0, to: pixels.height, by: stepY) {
+            for x in stride(from: 0, to: pixels.width, by: stepX) {
+                guard !inner.contains(CGPoint(x: x, y: y)), pixels.alpha(x, y) > 200 else { continue }
+                let color = pixels.color(x, y)
+                reds.append(color.r)
+                greens.append(color.g)
+                blues.append(color.b)
+            }
+        }
+        guard reds.count > 3 else { return nil }
+        func median(_ values: [CGFloat]) -> CGFloat {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        // Device RGB explicitly: the samples were read in that space, and going
+        // out through a generic-RGB CGColor shifts each channel by ~0.02, which
+        // is just enough to leave a visible seam around the patch.
+        return CGColor(
+            colorSpace: CGColorSpaceCreateDeviceRGB(),
+            components: [median(reds), median(greens), median(blues), 1]
+        )
+    }
+
+    /// Grown or shrunk about its own centre.
+    static func scaled(_ rect: CGRect, by factor: CGFloat) -> CGRect {
+        guard factor != 1 else { return rect }
+        let width = rect.width * factor
+        let height = rect.height * factor
+        return CGRect(x: rect.midX - width / 2, y: rect.midY - height / 2, width: width, height: height)
+    }
+
     private static func normalizedRect(_ a: CGPoint, _ b: CGPoint) -> CGRect {
         CGRect(
             x: min(a.x, b.x),
@@ -427,7 +616,7 @@ extension AnnotationTool {
     /// any markup that should stay legible on top of them.
     var obscures: Bool {
         switch self {
-        case .blur, .pixelate, .redact, .spotlight: return true
+        case .blur, .pixelate, .redact, .erase, .spotlight: return true
         default: return false
         }
     }
