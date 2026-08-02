@@ -218,6 +218,7 @@ final class EditorModel: ObservableObject {
         case .none:
             dragOrigin = nil
             movingBase = nil
+            grip = nil
 
         case .segment, .region:
             guard var finished = draft else { break }
@@ -289,10 +290,23 @@ final class EditorModel: ObservableObject {
 
     private func moveOrSelect(at imagePoint: CGPoint, normalized: CGPoint) {
         if let base = movingBase, let origin = dragOrigin {
+            if let grip {
+                applyResize(base: base, grip: grip, to: imagePoint)
+                return
+            }
             let delta = CGSize(width: imagePoint.x - origin.x, height: imagePoint.y - origin.y)
             if let index = annotations.firstIndex(where: { $0.id == base.id }) {
                 annotations[index] = base.translated(by: delta)
             }
+            return
+        }
+        // A grab near a handle of what is already selected resizes it; anywhere
+        // else picks up whatever is under the pointer.
+        if let selected = selectedAnnotation, let grabbed = grip(near: imagePoint, of: selected) {
+            grip = grabbed
+            movingBase = selected
+            dragOrigin = imagePoint
+            checkpoint()
             return
         }
         if let hit = annotation(at: imagePoint) {
@@ -320,14 +334,100 @@ final class EditorModel: ObservableObject {
         }
     }
 
+    var selectedAnnotation: Annotation? {
+        selection.flatMap { id in annotations.first { $0.id == id } }
+    }
+
     /// The selected markup's box, normalized over the output canvas with y from
     /// the top, so the view can outline it on the preview.
     var selectionBox: CGRect? {
-        guard let selection,
-              let annotation = annotations.first(where: { $0.id == selection })
-        else { return nil }
-        let minSide = CGFloat(min(source.width, source.height))
-        return normalizedCanvasRect(fromImage: annotation.bounds(minSide: minSide))
+        selectedAnnotation.map { normalizedCanvasRect(fromImage: $0.bounds(minSide: minSide)) }
+    }
+
+    /// Where the resize handles go, normalized over the canvas: the two ends of
+    /// a line, or the four corners of a region.
+    var selectionHandles: [CGPoint] {
+        guard let annotation = selectedAnnotation else { return [] }
+        return handlePoints(of: annotation).map(normalizedCanvasPoint(fromImage:))
+    }
+
+    /// Which handle, if any, a grab lands on.
+    private enum Grip {
+        case start
+        case end
+        case topLeft
+        case topRight
+        case bottomLeft
+        case bottomRight
+    }
+    private var grip: Grip?
+
+    private func handlePoints(of annotation: Annotation) -> [CGPoint] {
+        switch annotation.tool.input {
+        case .segment:
+            return [annotation.start, annotation.end]
+        case .region, .none:
+            // `.none` here is an image overlay; `.move` itself is never stored.
+            guard annotation.tool != .move else { return [] }
+            let rect = annotation.bounds(minSide: minSide)
+            return [
+                CGPoint(x: rect.minX, y: rect.minY),
+                CGPoint(x: rect.maxX, y: rect.minY),
+                CGPoint(x: rect.minX, y: rect.maxY),
+                CGPoint(x: rect.maxX, y: rect.maxY),
+            ]
+        case .stroke, .point:
+            // Freehand and badges scale with the weight slider instead.
+            return []
+        }
+    }
+
+    private func grip(near point: CGPoint, of annotation: Annotation) -> Grip? {
+        let tolerance = minSide * 0.02
+        let grips: [Grip] = annotation.tool.input == .segment
+            ? [.start, .end]
+            : [.topLeft, .topRight, .bottomLeft, .bottomRight]
+        let points = handlePoints(of: annotation)
+        guard points.count == grips.count else { return nil }
+        return zip(grips, points)
+            .first { hypot(point.x - $0.1.x, point.y - $0.1.y) < tolerance }?.0
+    }
+
+    private func applyResize(base: Annotation, grip: Grip, to point: CGPoint) {
+        guard let index = annotations.firstIndex(where: { $0.id == base.id }) else { return }
+        var updated = base
+        switch grip {
+        case .start:
+            updated.start = point
+        case .end:
+            updated.end = point
+        case .topLeft, .topRight, .bottomLeft, .bottomRight:
+            // Handles sit on the drawn box, so for an already-scaled image
+            // overlay the drag defines the new rect outright.
+            var rect = base.tool == .image
+                ? base.bounds(minSide: minSide)
+                : CGRect(
+                    x: min(base.start.x, base.end.x),
+                    y: min(base.start.y, base.end.y),
+                    width: abs(base.start.x - base.end.x),
+                    height: abs(base.start.y - base.end.y)
+                )
+            switch grip {
+            case .topLeft:
+                rect = CGRect(x: point.x, y: point.y, width: rect.maxX - point.x, height: rect.maxY - point.y)
+            case .topRight:
+                rect = CGRect(x: rect.minX, y: point.y, width: point.x - rect.minX, height: rect.maxY - point.y)
+            case .bottomLeft:
+                rect = CGRect(x: point.x, y: rect.minY, width: rect.maxX - point.x, height: point.y - rect.minY)
+            default:
+                rect = CGRect(x: rect.minX, y: rect.minY, width: point.x - rect.minX, height: point.y - rect.minY)
+            }
+            rect = rect.standardized
+            updated.start = CGPoint(x: rect.minX, y: rect.minY)
+            updated.end = CGPoint(x: rect.maxX, y: rect.maxY)
+            if base.tool == .image { updated.weight = 1 }
+        }
+        annotations[index] = updated
     }
 
     func deleteSelection() {
@@ -631,6 +731,11 @@ final class EditorModel: ObservableObject {
             x: min(max(p.x * canvas.width - origin.x, 0), image.width),
             y: min(max(p.y * canvas.height - origin.y, 0), image.height)
         )
+    }
+
+    private func normalizedCanvasPoint(fromImage point: CGPoint) -> CGPoint {
+        let (canvas, origin, _) = layout()
+        return CGPoint(x: (point.x + origin.x) / canvas.width, y: (point.y + origin.y) / canvas.height)
     }
 
     /// The inverse, for drawing overlays on the preview.

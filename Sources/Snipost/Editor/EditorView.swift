@@ -132,13 +132,11 @@ struct EditorView: View {
             context.stroke(path, with: .color(.black.opacity(0.65)), style: StrokeStyle(lineWidth: 1.5, dash: [4, 4]))
             context.stroke(path, with: .color(.white), style: StrokeStyle(lineWidth: 1.5, dash: [4, 4], dashPhase: 4))
 
-            for corner in [
-                CGPoint(x: rect.minX, y: rect.minY),
-                CGPoint(x: rect.maxX, y: rect.minY),
-                CGPoint(x: rect.minX, y: rect.maxY),
-                CGPoint(x: rect.maxX, y: rect.maxY),
-            ] {
-                let handle = Path(ellipseIn: CGRect(x: corner.x - 3.5, y: corner.y - 3.5, width: 7, height: 7))
+            // Handles come from the model, since they are what a drag near
+            // them will actually grab: line ends, or region corners.
+            for handle in model.selectionHandles {
+                let point = CGPoint(x: handle.x * size.width, y: handle.y * size.height)
+                let handle = Path(ellipseIn: CGRect(x: point.x - 3.5, y: point.y - 3.5, width: 7, height: 7))
                 context.fill(handle, with: .color(.white))
                 context.stroke(handle, with: .color(.black.opacity(0.5)), lineWidth: 1)
             }
