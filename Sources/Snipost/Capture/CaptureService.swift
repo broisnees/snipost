@@ -165,7 +165,44 @@ enum CaptureService {
         config.showsCursor = false
         config.captureResolution = .best
         config.backgroundColor = clearBackground
-        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        // SCK pads a single-window capture with room for the window's drop
+        // shadow. That transparent margin is invisible but real, so every
+        // downstream layout (corner radius, our own shadow, padding) would be
+        // aligned to a box larger than the window.
+        config.ignoreShadowsSingleWindow = true
+        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        return trimmingTransparentEdges(image) ?? image
+    }
+
+    /// Crops away fully transparent rows/columns — the shadow margin SCK can
+    /// still leave around a window capture, and any transparent gutter of a
+    /// non-rectangular window.
+    static func trimmingTransparentEdges(_ image: CGImage) -> CGImage? {
+        let width = image.width
+        let height = image.height
+        guard width > 0, height > 0 else { return nil }
+
+        guard let alpha = AlphaMap(image, width: width, height: height) else { return nil }
+
+        var minX = width, maxX = -1, minY = height, maxY = -1
+        for y in 0..<height {
+            for x in 0..<width where alpha[x, y] > 8 {
+                if x < minX { minX = x }
+                if x > maxX { maxX = x }
+                if y < minY { minY = y }
+                maxY = y
+            }
+        }
+        guard maxX >= minX, maxY >= minY else { return nil } // fully transparent
+        if minX == 0, minY == 0, maxX == width - 1, maxY == height - 1 { return image }
+
+        // Both AlphaMap and cropping() measure y from the top.
+        return image.cropping(to: CGRect(
+            x: minX,
+            y: minY,
+            width: maxX - minX + 1,
+            height: maxY - minY + 1
+        ))
     }
 
     /// Maps a selection in overlay-view points back to pixels of the frozen capture.

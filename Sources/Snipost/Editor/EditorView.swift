@@ -275,8 +275,8 @@ struct EditorView: View {
     }
 
     private var radiusSection: some View {
-        section("Corner radius", trailing: "\(Int(model.settings.cornerRadius)) pt") {
-            Slider(value: $model.settings.cornerRadius, in: 0...48)
+        section("Corner radius", trailing: "\(Int(model.settings.cornerRadius)) px") {
+            Slider(value: $model.settings.cornerRadius, in: 0...80)
         }
     }
 

@@ -48,6 +48,12 @@ final class EditorModel: ObservableObject {
         self.filteredSource = source
         self.composedSource = source
         self.autoColors = ColorAnalysis.autoGradient(for: source)
+        // A window capture arrives with its own rounded corners; start the
+        // slider there so it reflects the radius actually on screen.
+        self.settings.cornerRadius = max(
+            settings.cornerRadius,
+            BeautifyRenderer.sourceCornerRadius(of: source).rounded()
+        )
         renderPreview()
         loadWallpapers()
     }
