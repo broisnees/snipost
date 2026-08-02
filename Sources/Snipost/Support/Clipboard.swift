@@ -13,4 +13,11 @@ enum Clipboard {
             pasteboard.setData(tiff, forType: .tiff)
         }
     }
+
+    /// Image on the clipboard, for pasting one capture on top of another.
+    static func image() -> CGImage? {
+        guard let image = NSPasteboard.general.readObjects(forClasses: [NSImage.self])?.first as? NSImage
+        else { return nil }
+        return image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    }
 }
