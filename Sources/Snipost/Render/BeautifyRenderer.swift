@@ -129,14 +129,14 @@ enum BeautifyRenderer {
         let probe = min(min(image.width, image.height) / 2, 96)
         guard probe > 1,
               let strip = image.cropping(to: CGRect(x: 0, y: 0, width: 1, height: probe)),
-              let alpha = AlphaMap(strip, width: 1, height: probe)
+              let pixels = PixelMap(strip, width: 1, height: probe)
         else { return 0 }
 
         // The strip is the image's top-left corner: walk down from the top
         // until the edge turns solid.
         var transparent = 0
         for y in 0..<probe {
-            if alpha[0, y] > 128 { break }
+            if pixels.alpha(0, y) > 128 { break }
             transparent += 1
         }
         // An all-transparent probe says nothing about the corner (a tall

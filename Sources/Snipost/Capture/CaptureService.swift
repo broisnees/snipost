@@ -182,11 +182,11 @@ enum CaptureService {
         let height = image.height
         guard width > 0, height > 0 else { return nil }
 
-        guard let alpha = AlphaMap(image, width: width, height: height) else { return nil }
+        guard let pixels = PixelMap(image, width: width, height: height) else { return nil }
 
         var minX = width, maxX = -1, minY = height, maxY = -1
         for y in 0..<height {
-            for x in 0..<width where alpha[x, y] > 8 {
+            for x in 0..<width where pixels.alpha(x, y) > 8 {
                 if x < minX { minX = x }
                 if x > maxX { maxX = x }
                 if y < minY { minY = y }
@@ -196,7 +196,7 @@ enum CaptureService {
         guard maxX >= minX, maxY >= minY else { return nil } // fully transparent
         if minX == 0, minY == 0, maxX == width - 1, maxY == height - 1 { return image }
 
-        // Both AlphaMap and cropping() measure y from the top.
+        // Both PixelMap and cropping() measure y from the top.
         return image.cropping(to: CGRect(
             x: minX,
             y: minY,

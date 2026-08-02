@@ -13,6 +13,7 @@ struct EditorView: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 20) {
                         annotateSection
+                        imageSection
                         backgroundSection
                         wallpaperSection
                         customColorSection
@@ -79,7 +80,21 @@ struct EditorView: View {
                                             ))
                                         }
                                 )
+                                .onContinuousHover(coordinateSpace: .local) { phase in
+                                    guard model.inspecting else { return }
+                                    switch phase {
+                                    case .active(let location):
+                                        model.updateLoupe(atNormalized: CGPoint(
+                                            x: location.x / max(geo.size.width, 1),
+                                            y: location.y / max(geo.size.height, 1)
+                                        ))
+                                    case .ended:
+                                        break
+                                    }
+                                }
                                 .overlay(selectionOverlay(in: geo.size))
+                                .overlay(cropOverlay(in: geo.size))
+                                .overlay(loupeOverlay(in: geo.size))
                         }
                     )
                     .padding(28)
@@ -126,6 +141,87 @@ struct EditorView: View {
                 let handle = Path(ellipseIn: CGRect(x: corner.x - 3.5, y: corner.y - 3.5, width: 7, height: 7))
                 context.fill(handle, with: .color(.white))
                 context.stroke(handle, with: .color(.black.opacity(0.5)), lineWidth: 1)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    /// Dims everything the pending crop would discard.
+    private func cropOverlay(in size: CGSize) -> some View {
+        Canvas { context, canvasSize in
+            guard model.cropping else { return }
+            guard let box = model.cropBox else {
+                context.fill(Path(CGRect(origin: .zero, size: canvasSize)), with: .color(.black.opacity(0.25)))
+                return
+            }
+            let rect = CGRect(
+                x: box.minX * size.width,
+                y: box.minY * size.height,
+                width: box.width * size.width,
+                height: box.height * size.height
+            )
+            var outside = Path(CGRect(origin: .zero, size: canvasSize))
+            outside.addRect(rect)
+            context.fill(outside, with: .color(.black.opacity(0.45)), style: FillStyle(eoFill: true))
+            context.stroke(Path(rect), with: .color(.white), lineWidth: 1)
+
+            // Thirds, the way every crop tool does it.
+            for fraction in [1.0 / 3.0, 2.0 / 3.0] {
+                var guides = Path()
+                guides.move(to: CGPoint(x: rect.minX + rect.width * fraction, y: rect.minY))
+                guides.addLine(to: CGPoint(x: rect.minX + rect.width * fraction, y: rect.maxY))
+                guides.move(to: CGPoint(x: rect.minX, y: rect.minY + rect.height * fraction))
+                guides.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + rect.height * fraction))
+                context.stroke(guides, with: .color(.white.opacity(0.35)), lineWidth: 0.5)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func loupePosition(near point: CGPoint, in size: CGSize, side: CGFloat) -> CGPoint {
+        let offset = side * 0.75
+        let dx: CGFloat = point.x > size.width - side ? -offset : offset
+        let dy: CGFloat = point.y > size.height - side ? -offset : offset
+        let half = side / 2
+        let x = min(max(point.x + dx, half), max(size.width - half, half))
+        let y = min(max(point.y + dy, half), max(size.height - half, half))
+        return CGPoint(x: x, y: y)
+    }
+
+    /// Magnified pixels under the pointer, with the colour readout.
+    private func loupeOverlay(in size: CGSize) -> some View {
+        Group {
+            if let loupe = model.loupe, let patch = loupe.patch {
+                let side: CGFloat = 104
+                let point = CGPoint(x: loupe.at.x * size.width, y: loupe.at.y * size.height)
+                VStack(spacing: 0) {
+                    Image(nsImage: NSImage(cgImage: patch, size: NSSize(width: patch.width, height: patch.height)))
+                        // Nearest-neighbour, or magnified pixels turn to mush.
+                        .interpolation(.none)
+                        .resizable()
+                        .frame(width: side, height: side)
+                        .overlay(
+                            Rectangle()
+                                .strokeBorder(Color.white, lineWidth: 1)
+                                .frame(width: side / 15, height: side / 15)
+                        )
+                    HStack(spacing: 5) {
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color(red: Double(loupe.color.r), green: Double(loupe.color.g), blue: Double(loupe.color.b)))
+                            .frame(width: 10, height: 10)
+                        Text(loupe.hex)
+                            .font(.system(size: 10, weight: .medium).monospaced())
+                            .foregroundStyle(.white)
+                    }
+                    .frame(width: side, height: 18)
+                    .background(Color.black.opacity(0.75))
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.black.opacity(0.4)))
+                .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+                // Sits beside the pointer, flipping side and edge so it never
+                // runs off the preview or hides what is being sampled.
+                .position(loupePosition(near: point, in: size, side: side))
             }
         }
         .allowsHitTesting(false)
@@ -189,6 +285,22 @@ struct EditorView: View {
         }
     }
 
+    /// A button that stays lit while its mode is armed.
+    private func toggleButton(_ title: String, symbol: String, isOn: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: symbol)
+                .font(.system(size: 12, weight: isOn ? .semibold : .regular))
+                .frame(maxWidth: .infinity, minHeight: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(isOn ? Color.accentColor : Color.primary.opacity(0.06))
+                )
+                .foregroundStyle(isOn ? Color.white : Color.primary)
+                .contentShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(PressableButtonStyle())
+    }
+
     private func toolButton(_ tool: AnnotationTool) -> some View {
         let isSelected = model.tool == tool
         return Button { model.tool = tool } label: {
@@ -204,6 +316,80 @@ struct EditorView: View {
         }
         .buttonStyle(PressableButtonStyle())
         .help(tool.rawValue)
+    }
+
+    /// Operations on the capture itself, as opposed to the frame around it.
+    private var imageSection: some View {
+        section("Image", trailing: "\(model.source.width) × \(model.source.height)") {
+            HStack(spacing: 6) {
+                toggleButton("Crop", symbol: "crop", isOn: model.cropping) {
+                    model.cropping.toggle()
+                    if model.cropping { model.inspecting = false }
+                }
+                toggleButton("Pick", symbol: "eyedropper", isOn: model.inspecting) {
+                    model.inspecting.toggle()
+                    if model.inspecting { model.cropping = false }
+                }
+                .help("Magnify pixels and copy the colour under the pointer")
+            }
+
+            if model.cropping {
+                HStack(spacing: 6) {
+                    Button("Apply crop") { model.applyCrop() }
+                        .controlSize(.small)
+                        .disabled(model.cropRect == nil)
+                    Button("Cancel") { model.cropping = false }
+                        .controlSize(.small)
+                }
+            }
+
+            if let loupe = model.loupe {
+                HStack(spacing: 8) {
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color(red: Double(loupe.color.r), green: Double(loupe.color.g), blue: Double(loupe.color.b)))
+                        .frame(width: 22, height: 22)
+                        .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Color.primary.opacity(0.15)))
+                    Text(loupe.hex)
+                        .font(.system(size: 12, weight: .medium).monospaced())
+                    Spacer()
+                    Text("\(Int(loupe.pixel.x)), \(Int(loupe.pixel.y))")
+                        .font(.system(size: 11).monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            HStack(spacing: 6) {
+                Text("Scale")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                ForEach([0.5, 0.75, 2.0], id: \.self) { factor in
+                    Button(factor == 2.0 ? "200%" : "\(Int(factor * 100))%") {
+                        model.resize(scale: CGFloat(factor))
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            HStack(spacing: 6) {
+                Button {
+                    model.addCapture(axis: .vertical)
+                } label: {
+                    Label("Add below", systemImage: "rectangle.stack.badge.plus")
+                        .frame(maxWidth: .infinity)
+                }
+                .controlSize(.small)
+                .help("Take another capture and put it on this canvas")
+
+                Button {
+                    model.pinToDesktop()
+                } label: {
+                    Label("Pin", systemImage: "pin")
+                        .frame(maxWidth: .infinity)
+                }
+                .controlSize(.small)
+                .help("Float this render above every other window")
+            }
+        }
     }
 
     private var backgroundSection: some View {

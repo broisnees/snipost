@@ -5,8 +5,10 @@ import Vision
 
 @MainActor
 final class EditorModel: ObservableObject {
-    let source: CGImage
-    let autoColors: [RGB]
+    /// The capture being edited. Crop, resize and combine replace it, so it is
+    /// part of the undo state rather than a constant.
+    @Published private(set) var source: CGImage
+    @Published private(set) var autoColors: [RGB]
 
     @Published var settings = BeautifySettings() {
         didSet {
@@ -32,8 +34,41 @@ final class EditorModel: ObservableObject {
     @Published var annotationWeight: CGFloat = 1
     /// The markup the Select tool has picked up, if any.
     @Published var selection: UUID?
-    @Published private var undoStack: [[Annotation]] = []
-    @Published private var redoStack: [[Annotation]] = []
+    /// Undo covers the image too, not just markup — cropping and resizing are
+    /// as reversible as drawing. CGImages are immutable and cropped ones share
+    /// their parent's buffer, so keeping them here is cheap.
+    private struct EditState {
+        var annotations: [Annotation]
+        var source: CGImage
+    }
+    @Published private var undoStack: [EditState] = []
+    @Published private var redoStack: [EditState] = []
+
+    // Crop
+    @Published var cropping = false {
+        didSet { if !cropping { cropRect = nil } }
+    }
+    /// Pending crop in source-image pixels, y from the top.
+    @Published private(set) var cropRect: CGRect?
+    private var cropAnchor: CGPoint?
+
+    // Pixel loupe / colour picker
+    @Published var inspecting = false {
+        didSet { if !inspecting { loupe = nil } }
+    }
+    @Published private(set) var loupe: Loupe?
+    /// Built on demand — a full pixel copy of the capture is only worth its
+    /// memory while someone is actually picking colours.
+    private var pixels: PixelMap?
+
+    struct Loupe {
+        /// Pointer position, normalized over the output canvas.
+        var at: CGPoint
+        var patch: CGImage?
+        var hex: String
+        var color: RGB
+        var pixel: CGPoint
+    }
     private var draft: Annotation?
     /// Where a move drag started, and the annotation as it was at that moment —
     /// translating from the original each time keeps the drag from drifting.
@@ -115,6 +150,18 @@ final class EditorModel: ObservableObject {
     // MARK: Preview interaction (cursor placement or annotation drawing)
 
     func dragChanged(atNormalized point: CGPoint) {
+        // Crop and inspect take over the preview while they are armed.
+        if cropping {
+            let anchor = cropAnchor ?? point
+            cropAnchor = anchor
+            cropDragChanged(from: anchor, to: point)
+            return
+        }
+        if inspecting {
+            updateLoupe(atNormalized: point)
+            return
+        }
+
         let imagePoint = self.imagePoint(fromCanvasNormalized: point)
         switch tool.input {
         case .none:
@@ -156,6 +203,16 @@ final class EditorModel: ObservableObject {
     }
 
     func dragEnded(atNormalized point: CGPoint) {
+        if cropping {
+            cropAnchor = nil
+            return
+        }
+        if inspecting {
+            updateLoupe(atNormalized: point)
+            copyPickedColor()
+            return
+        }
+
         let imagePoint = self.imagePoint(fromCanvasNormalized: point)
         switch tool.input {
         case .none:
@@ -285,7 +342,7 @@ final class EditorModel: ObservableObject {
     // MARK: Undo
 
     private func checkpoint() {
-        undoStack.append(annotations)
+        undoStack.append(EditState(annotations: annotations, source: source))
         if undoStack.count > 60 { undoStack.removeFirst() }
         redoStack.removeAll()
     }
@@ -295,16 +352,161 @@ final class EditorModel: ObservableObject {
 
     func undo() {
         guard let previous = undoStack.popLast() else { return }
-        redoStack.append(annotations)
-        annotations = previous
-        pruneSelection()
+        redoStack.append(EditState(annotations: annotations, source: source))
+        restore(previous)
     }
 
     func redo() {
         guard let next = redoStack.popLast() else { return }
-        undoStack.append(annotations)
-        annotations = next
+        undoStack.append(EditState(annotations: annotations, source: source))
+        restore(next)
+    }
+
+    private func restore(_ state: EditState) {
+        if state.source !== source {
+            adopt(state.source)
+        }
+        annotations = state.annotations
         pruneSelection()
+    }
+
+    // MARK: Crop, resize, combine
+
+    /// Called while dragging with the crop tool armed; both points are
+    /// normalized over the output canvas.
+    func cropDragChanged(from anchor: CGPoint, to point: CGPoint) {
+        let a = imagePoint(fromCanvasNormalized: anchor)
+        let b = imagePoint(fromCanvasNormalized: point)
+        cropRect = CGRect(
+            x: min(a.x, b.x),
+            y: min(a.y, b.y),
+            width: abs(a.x - b.x),
+            height: abs(a.y - b.y)
+        )
+    }
+
+    /// The pending crop, normalized over the canvas, for the preview overlay.
+    var cropBox: CGRect? {
+        cropRect.map { normalizedCanvasRect(fromImage: $0) }
+    }
+
+    func applyCrop() {
+        guard let rect = cropRect?.integral,
+              rect.width > 8, rect.height > 8,
+              let cropped = source.cropping(to: rect.intersection(sourceBounds))
+        else { return }
+        checkpoint()
+        adopt(cropped)
+        // Markup keeps its place on the picture, so it moves with the crop.
+        annotations = annotations
+            .map { $0.translated(by: CGSize(width: -rect.minX, height: -rect.minY)) }
+            .filter { $0.bounds(minSide: minSide).intersects(sourceBounds) }
+        cropping = false
+        selection = nil
+    }
+
+    func resize(scale: CGFloat) {
+        let width = Int((CGFloat(source.width) * scale).rounded())
+        let height = Int((CGFloat(source.height) * scale).rounded())
+        guard width > 8, height > 8, abs(scale - 1) > 0.001,
+              let scaled = ImageOps.scaled(source, width: width, height: height)
+        else { return }
+        checkpoint()
+        adopt(scaled)
+        annotations = annotations.map { annotation in
+            var scaledAnnotation = annotation
+            scaledAnnotation.start = CGPoint(x: annotation.start.x * scale, y: annotation.start.y * scale)
+            scaledAnnotation.end = CGPoint(x: annotation.end.x * scale, y: annotation.end.y * scale)
+            scaledAnnotation.points = annotation.points.map { CGPoint(x: $0.x * scale, y: $0.y * scale) }
+            return scaledAnnotation
+        }
+    }
+
+    /// Grabs another area shot and appends it to this canvas.
+    func addCapture(axis: ImageOps.Axis) {
+        CaptureService.capture(.area) { [weak self] image in
+            guard let self, let image else { return }
+            self.addCapture(image, axis: axis)
+            self.flashSaveMessage("Added to canvas")
+        }
+    }
+
+    /// Puts another capture on the same canvas, below or beside this one.
+    func addCapture(_ image: CGImage, axis: ImageOps.Axis) {
+        guard let combined = ImageOps.stacked([source, image], axis: axis, gap: 0) else { return }
+        checkpoint()
+        adopt(combined)
+    }
+
+    // MARK: Pixel loupe and colour picker
+
+    /// Magnified patch and colour readout under the pointer.
+    func updateLoupe(atNormalized point: CGPoint) {
+        guard inspecting else {
+            loupe = nil
+            return
+        }
+        if pixels == nil {
+            pixels = PixelMap(source, width: source.width, height: source.height)
+        }
+        let imagePoint = self.imagePoint(fromCanvasNormalized: point)
+        let x = Int(imagePoint.x.rounded(.down))
+        let y = Int(imagePoint.y.rounded(.down))
+        guard let pixels, x >= 0, y >= 0, x < pixels.width, y < pixels.height else {
+            loupe = nil
+            return
+        }
+        // Odd span so there is a true centre pixel to line the crosshair up on.
+        let span = 15
+        let patchRect = CGRect(
+            x: x - span / 2,
+            y: y - span / 2,
+            width: span,
+            height: span
+        ).intersection(sourceBounds).integral
+        loupe = Loupe(
+            at: point,
+            patch: patchRect.isEmpty ? nil : source.cropping(to: patchRect),
+            hex: pixels.hex(x, y),
+            color: pixels.color(x, y),
+            pixel: CGPoint(x: x, y: y)
+        )
+    }
+
+    func copyPickedColor() {
+        guard let loupe else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(loupe.hex, forType: .string)
+        flashSaveMessage("Copied \(loupe.hex)")
+    }
+
+    // MARK: Pin
+
+    /// Floats the finished render above everything as a borderless window.
+    func pinToDesktop() {
+        guard let rendered = renderFull() else { return }
+        PinnedWindow.show(rendered)
+        flashSaveMessage("Pinned — ⌘W or double-click to close")
+    }
+
+    private var sourceBounds: CGRect {
+        CGRect(x: 0, y: 0, width: CGFloat(source.width), height: CGFloat(source.height))
+    }
+
+    private var minSide: CGFloat {
+        CGFloat(min(source.width, source.height))
+    }
+
+    /// Single path for swapping the capture: everything derived from it has to
+    /// be rebuilt, or the preview keeps rendering the old pixels.
+    private func adopt(_ image: CGImage) {
+        source = image
+        autoColors = ColorAnalysis.autoGradient(for: image)
+        filteredSource = ImageFilters.apply(settings.filter, to: image)
+        pixels = nil
+        cropRect = nil
+        rebuildComposition()
+        renderPreview()
     }
 
     private func pruneSelection() {
