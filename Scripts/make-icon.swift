@@ -1,5 +1,5 @@
-// Generates Resources/AppIcon.icns: an indigo gradient squircle with a white
-// viewfinder + lens glyph. Run: swift Scripts/make-icon.swift
+// Generates Resources/AppIcon.icns: a monochrome charcoal squircle with the
+// two-tone grey Snipost mark (capture brackets + outbound arrow). Run: swift Scripts/make-icon.swift
 import AppKit
 import ImageIO
 import UniformTypeIdentifiers
@@ -20,77 +20,67 @@ func drawIcon(canvas: Int) -> CGImage? {
     let plate = CGRect(x: margin, y: margin, width: full - margin * 2, height: full - margin * 2)
     let platePath = CGPath(roundedRect: plate, cornerWidth: 185 * s, cornerHeight: 185 * s, transform: nil)
 
-    // Soft shadow behind the plate.
     ctx.saveGState()
-    ctx.setShadow(offset: CGSize(width: 0, height: -12 * s), blur: 28 * s,
-                  color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.35))
+    ctx.setShadow(offset: CGSize(width: 0, height: -10 * s), blur: 24 * s,
+                  color: CGColor(gray: 0, alpha: 0.45))
     ctx.addPath(platePath)
-    ctx.setFillColor(CGColor(red: 0.35, green: 0.34, blue: 0.84, alpha: 1))
+    ctx.setFillColor(CGColor(gray: 0.08, alpha: 1))
     ctx.fillPath()
     ctx.restoreGState()
 
-    // Gradient fill.
+    // Charcoal plate: soft top-to-bottom falloff.
     ctx.saveGState()
     ctx.addPath(platePath)
     ctx.clip()
-    let colors = [
-        CGColor(red: 0.42, green: 0.40, blue: 0.94, alpha: 1),
-        CGColor(red: 0.55, green: 0.30, blue: 0.78, alpha: 1),
-    ] as CFArray
-    if let gradient = CGGradient(colorsSpace: colorSpace, colors: colors, locations: [0, 1]) {
-        ctx.drawLinearGradient(
-            gradient,
-            start: CGPoint(x: plate.minX, y: plate.maxY),
-            end: CGPoint(x: plate.maxX, y: plate.minY),
-            options: []
-        )
-    }
-    // Radial glow near the top.
-    if let glow = CGGradient(colorsSpace: colorSpace, colors: [
-        CGColor(red: 1, green: 1, blue: 1, alpha: 0.25),
-        CGColor(red: 1, green: 1, blue: 1, alpha: 0),
+    if let gradient = CGGradient(colorsSpace: colorSpace, colors: [
+        CGColor(red: 0.17, green: 0.17, blue: 0.18, alpha: 1),
+        CGColor(red: 0.05, green: 0.05, blue: 0.06, alpha: 1),
     ] as CFArray, locations: [0, 1]) {
-        let center = CGPoint(x: full / 2, y: plate.maxY - 40 * s)
-        ctx.drawRadialGradient(glow, startCenter: center, startRadius: 0,
-                               endCenter: center, endRadius: 620 * s, options: [])
+        ctx.drawLinearGradient(gradient, start: CGPoint(x: 0, y: plate.maxY),
+                               end: CGPoint(x: 0, y: plate.minY), options: [])
     }
     ctx.restoreGState()
 
-    // White glyph: viewfinder corner brackets + lens ring + dot.
-    ctx.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
-    ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
-    ctx.setLineWidth(46 * s)
-    ctx.setLineCap(.round)
+    // Hairline rim highlight.
+    ctx.saveGState()
+    ctx.addPath(CGPath(roundedRect: plate.insetBy(dx: 3 * s, dy: 3 * s),
+                       cornerWidth: 182 * s, cornerHeight: 182 * s, transform: nil))
+    ctx.setStrokeColor(CGColor(gray: 1, alpha: 0.10))
+    ctx.setLineWidth(max(0.5, 5 * s))
+    ctx.strokePath()
+    ctx.restoreGState()
 
-    let inset = 280 * s
-    let arm = 105 * s
-    let minX = inset, maxX = full - inset, minY = inset, maxY = full - inset
-
-    // Corner brackets.
-    for (cx, cy, dx, dy) in [
-        (minX, maxY, 1.0, -1.0),  // top-left
-        (maxX, maxY, -1.0, -1.0), // top-right
-        (minX, minY, 1.0, 1.0),   // bottom-left
-        (maxX, minY, -1.0, 1.0),  // bottom-right
-    ] {
-        ctx.beginPath()
-        ctx.move(to: CGPoint(x: cx + CGFloat(dx) * arm, y: cy))
-        ctx.addLine(to: CGPoint(x: cx, y: cy))
-        ctx.addLine(to: CGPoint(x: cx, y: cy + CGFloat(dy) * arm))
-        ctx.strokePath()
+    // Glyph (same geometry as BrandMark.glyphPath), outlined so it can be
+    // filled two-tone: light upper half, darker lower half, split by a gap.
+    let glyphRect = CGRect(x: 250 * s, y: 250 * s, width: 524 * s, height: 524 * s)
+    func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+        CGPoint(x: glyphRect.minX + x * glyphRect.width, y: glyphRect.minY + y * glyphRect.height)
     }
+    let line = CGMutablePath()
+    line.move(to: p(0.10, 0.60)); line.addLine(to: p(0.10, 0.90)); line.addLine(to: p(0.40, 0.90))
+    line.move(to: p(0.60, 0.10)); line.addLine(to: p(0.90, 0.10)); line.addLine(to: p(0.90, 0.40))
+    line.move(to: p(0.32, 0.32)); line.addLine(to: p(0.84, 0.84))
+    line.move(to: p(0.56, 0.84)); line.addLine(to: p(0.84, 0.84)); line.addLine(to: p(0.84, 0.56))
+    let glyph = line.copy(strokingWithWidth: 70 * s, lineCap: .round, lineJoin: .round, miterLimit: 10)
 
-    // Lens.
-    let lensRadius = 128 * s
-    ctx.strokeEllipse(in: CGRect(
-        x: full / 2 - lensRadius, y: full / 2 - lensRadius,
-        width: lensRadius * 2, height: lensRadius * 2
-    ))
-    let dotRadius = 44 * s
-    ctx.fillEllipse(in: CGRect(
-        x: full / 2 - dotRadius, y: full / 2 - dotRadius,
-        width: dotRadius * 2, height: dotRadius * 2
-    ))
+    let midY = glyphRect.midY
+    let gap = 14 * s
+    for (band, top, bottom) in [
+        (CGRect(x: 0, y: midY + gap / 2, width: full, height: full), 0.96, 0.80),
+        (CGRect(x: 0, y: 0, width: full, height: midY - gap / 2), 0.62, 0.46),
+    ] {
+        ctx.saveGState()
+        ctx.addPath(glyph)
+        ctx.clip()
+        ctx.clip(to: band)
+        if let gradient = CGGradient(colorsSpace: colorSpace, colors: [
+            CGColor(gray: top, alpha: 1), CGColor(gray: bottom, alpha: 1),
+        ] as CFArray, locations: [0, 1]) {
+            ctx.drawLinearGradient(gradient, start: CGPoint(x: 0, y: glyphRect.maxY),
+                                   end: CGPoint(x: 0, y: glyphRect.minY), options: [])
+        }
+        ctx.restoreGState()
+    }
 
     return ctx.makeImage()
 }
