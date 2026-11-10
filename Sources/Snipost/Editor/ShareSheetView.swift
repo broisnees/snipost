@@ -76,18 +76,20 @@ struct ShareSheetView: View {
     }
 
     private func openIntent(_ intent: WebIntent) {
-        guard let image = model.renderFull() else { return }
-        ShareService.openWebIntent(intent, caption: caption, image: image)
-        status = "Posted \(intent.rawValue) composer — image attaches in a few seconds (⌘V if it's missing)"
+        Task {
+            guard let image = await model.renderFullAsync() else { return }
+            ShareService.openWebIntent(intent, caption: caption, image: image)
+            status = "Opened \(intent.rawValue) composer — image attaches in a few seconds (⌘V if it's missing)"
+        }
     }
 
     private func postBluesky() {
-        guard let image = model.renderFull() else { return }
         busy = true
         status = nil
         let handle = accounts.blueskyHandle
         let password = accounts.blueskyAppPassword
         Task {
+            guard let image = await model.renderFullAsync() else { busy = false; return }
             do {
                 let link = try await ShareService.postToBluesky(
                     caption: caption, image: image, handle: handle, appPassword: password
@@ -102,12 +104,12 @@ struct ShareSheetView: View {
     }
 
     private func postMastodon() {
-        guard let image = model.renderFull() else { return }
         busy = true
         status = nil
         let instance = accounts.mastodonInstance
         let token = accounts.mastodonToken
         Task {
+            guard let image = await model.renderFullAsync() else { busy = false; return }
             do {
                 let link = try await ShareService.postToMastodon(
                     caption: caption, image: image, instance: instance, token: token
