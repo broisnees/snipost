@@ -20,8 +20,12 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 # Prefer a real signing identity: it stays stable across rebuilds, so macOS
 # keeps the Screen Recording permission. Ad-hoc (-) changes every build and
 # resets TCC each time.
-IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
-    | grep -o '"Apple Development: [^"]*"' | head -1 | tr -d '"')
+# Order: $SNIPOST_SIGN_IDENTITY, an Apple Development cert, then any valid
+# local code-signing identity (a self-signed cert is stable enough for TCC).
+IDENTITIES=$(security find-identity -v -p codesigning 2>/dev/null || true)
+IDENTITY="${SNIPOST_SIGN_IDENTITY:-}"
+[ -z "$IDENTITY" ] && IDENTITY=$(echo "$IDENTITIES" | grep -o '"Apple Development: [^"]*"' | head -1 | tr -d '"' || true)
+[ -z "$IDENTITY" ] && IDENTITY=$(echo "$IDENTITIES" | grep -o '"[^"]*"' | head -1 | tr -d '"' || true)
 if [ -n "$IDENTITY" ]; then
     echo "Signing with: $IDENTITY"
     codesign --force --sign "$IDENTITY" "$APP"
