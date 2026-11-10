@@ -39,15 +39,19 @@ enum CaptureService {
                         frozen = try await captureDisplay(target.display, showsCursor: includeCursor)
                     }
                     let viewSize = target.screen.frame.size
+                    // Windows too, so Space can flip to window capture.
                     SelectionOverlayController.begin(
                         mode: .area,
                         screen: target.screen,
                         frozen: frozen,
-                        windows: []
+                        windows: pickableWindows(in: content, display: target.display)
                     ) { result in
-                        if case .rect(let viewRect) = result {
+                        switch result {
+                        case .rect(let viewRect):
                             completion(crop(frozen, viewRect: viewRect, viewSize: viewSize))
-                        } else {
+                        case .window(let scWindow, let viewRect):
+                            finishWindow(scWindow, viewRect: viewRect, frozen: frozen, viewSize: viewSize, completion: completion)
+                        case .cancelled:
                             completion(nil)
                         }
                     }
@@ -64,17 +68,7 @@ enum CaptureService {
                         windows: pickable
                     ) { result in
                         if case .window(let scWindow, let viewRect) = result {
-                            Task { @MainActor in
-                                // Give the overlay a beat to disappear first.
-                                try? await Task.sleep(nanoseconds: 120_000_000)
-                                if let isolated = try? await captureWindow(scWindow) {
-                                    completion(isolated)
-                                } else {
-                                    // Clean capture failed — fall back to cropping
-                                    // the window's rect out of the frozen screen.
-                                    completion(crop(frozen, viewRect: viewRect, viewSize: viewSize))
-                                }
-                            }
+                            finishWindow(scWindow, viewRect: viewRect, frozen: frozen, viewSize: viewSize, completion: completion)
                         } else {
                             completion(nil)
                         }
@@ -85,6 +79,151 @@ enum CaptureService {
                 completion(nil)
             }
         }
+    }
+
+    @MainActor
+    private static func finishWindow(
+        _ scWindow: SCWindow, viewRect: CGRect, frozen: CGImage, viewSize: CGSize,
+        completion: @escaping @MainActor (CGImage?) -> Void
+    ) {
+        Task { @MainActor in
+            // Give the overlay a beat to disappear first.
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            if let isolated = try? await captureWindow(scWindow) {
+                completion(isolated)
+            } else {
+                // Clean capture failed — crop the window's rect out of the frozen screen.
+                completion(crop(frozen, viewRect: viewRect, viewSize: viewSize))
+            }
+        }
+    }
+
+    /// "Repeat last area": captures the previously selected rect again with
+    /// no overlay.
+    static func captureLastArea(completion: @escaping @MainActor (CGImage?) -> Void) {
+        Task { @MainActor in
+            guard let rect = SelectionOverlayController.lastArea else {
+                Toast.show("No previous area yet — make an area capture first")
+                completion(nil)
+                return
+            }
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                guard let target = targetDisplay(in: content) else { completion(nil); return }
+                let size = target.screen.frame.size
+                let clamped = rect.intersection(CGRect(origin: .zero, size: size))
+                guard !clamped.isEmpty else { completion(nil); return }
+                let full = try await captureDisplay(target.display, showsCursor: Preferences.shared.includeCursor)
+                completion(crop(full, viewRect: clamped, viewSize: size))
+            } catch {
+                presentPermissionHelp()
+                completion(nil)
+            }
+        }
+    }
+
+    // MARK: Region picking (recording / AI watch)
+
+    /// A dragged-out area of one display, in every coordinate space callers need.
+    struct PickedRegion {
+        let display: SCDisplay
+        let screen: NSScreen
+        /// Bottom-left origin, relative to the screen.
+        let viewRect: CGRect
+
+        /// Top-left origin in display points — what SCStreamConfiguration.sourceRect wants.
+        var sourceRect: CGRect {
+            CGRect(x: viewRect.minX, y: screen.frame.height - viewRect.maxY,
+                   width: viewRect.width, height: viewRect.height)
+        }
+
+        /// Global Cocoa coordinates, for placing windows around the region.
+        var globalRect: NSRect {
+            viewRect.offsetBy(dx: screen.frame.minX, dy: screen.frame.minY)
+        }
+
+        var pointPixelScale: CGFloat { screen.backingScaleFactor }
+    }
+
+    /// Freezes the display under the mouse and lets the user drag a region.
+    static func pickRegion(hint: String, completion: @escaping @MainActor (PickedRegion?) -> Void) {
+        Task { @MainActor in
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                guard let target = targetDisplay(in: content) else {
+                    completion(nil)
+                    return
+                }
+                try await Task.sleep(nanoseconds: 200_000_000)
+                let frozen = try await captureDisplay(target.display, showsCursor: false)
+                SelectionOverlayController.begin(
+                    mode: .area,
+                    screen: target.screen,
+                    frozen: frozen,
+                    windows: pickableWindows(in: content, display: target.display),
+                    hint: hint
+                ) { result in
+                    switch result {
+                    case .rect(let rect), .window(_, let rect):
+                        let bounds = CGRect(origin: .zero, size: target.screen.frame.size)
+                        completion(PickedRegion(display: target.display, screen: target.screen,
+                                                viewRect: rect.intersection(bounds)))
+                    case .cancelled:
+                        completion(nil)
+                    }
+                }
+            } catch {
+                presentPermissionHelp()
+                completion(nil)
+            }
+        }
+    }
+
+    /// Repeated snapshots of one region (scrolling capture, AI watch). Builds
+    /// the content filter once — SCShareableContent is the expensive part.
+    final class RegionGrabber: @unchecked Sendable {
+        private let filter: SCContentFilter
+        private let config: SCStreamConfiguration
+
+        init(_ region: PickedRegion, maxPixelSize: CGFloat? = nil) async throws {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            let ownApps = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
+            let display = content.displays.first { $0.displayID == region.display.displayID } ?? region.display
+            filter = SCContentFilter(display: display, excludingApplications: ownApps, exceptingWindows: [])
+            config = SCStreamConfiguration()
+            var scale = region.pointPixelScale
+            if let maxPixelSize {
+                let longest = max(region.sourceRect.width, region.sourceRect.height) * scale
+                if longest > maxPixelSize { scale *= maxPixelSize / longest }
+            }
+            config.sourceRect = region.sourceRect
+            config.width = max(2, Int(region.sourceRect.width * scale))
+            config.height = max(2, Int(region.sourceRect.height * scale))
+            config.showsCursor = false
+        }
+
+        func grab() async throws -> CGImage {
+            try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        }
+    }
+
+    /// Snapshot of a region with Snipost's own windows (HUDs, borders) left out.
+    static func captureRegion(_ region: PickedRegion, maxPixelSize: CGFloat? = nil) async throws -> CGImage {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let ownApps = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
+        let display = content.displays.first { $0.displayID == region.display.displayID } ?? region.display
+        let filter = SCContentFilter(display: display, excludingApplications: ownApps, exceptingWindows: [])
+        let config = SCStreamConfiguration()
+        var scale = region.pointPixelScale
+        if let maxPixelSize {
+            let longest = max(region.sourceRect.width, region.sourceRect.height) * scale
+            if longest > maxPixelSize { scale *= maxPixelSize / longest }
+        }
+        config.sourceRect = region.sourceRect
+        config.width = max(2, Int(region.sourceRect.width * scale))
+        config.height = max(2, Int(region.sourceRect.height * scale))
+        config.showsCursor = false
+        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
     }
 
     // MARK: Display / window selection
@@ -182,7 +321,7 @@ enum CaptureService {
     }
 
     @MainActor
-    private static func presentPermissionHelp() {
+    static func presentPermissionHelp() {
         let alert = NSAlert()
         alert.messageText = "Snipost needs Screen Recording permission"
         alert.informativeText = """
