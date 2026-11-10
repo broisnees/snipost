@@ -22,6 +22,8 @@
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Snipost records your microphone alongside screen recordings when you turn it on.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 </dict>

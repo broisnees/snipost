@@ -16,7 +16,11 @@ final class DriveService: ObservableObject {
     @Published var clientSecret: String {
         didSet { Keychain.set(clientSecret, for: "drive.clientSecret") }
     }
-    @Published private(set) var isConnected: Bool
+    /// Mirrored in UserDefaults so checking it never touches the Keychain
+    /// (a Keychain read can raise a macOS access prompt mid-capture).
+    @Published private(set) var isConnected: Bool {
+        didSet { defaults.set(isConnected, forKey: "drive.connected") }
+    }
     @Published private(set) var isConnecting = false
     @Published var lastError: String?
 
@@ -25,8 +29,15 @@ final class DriveService: ObservableObject {
 
     private init() {
         clientID = UserDefaults.standard.string(forKey: "drive.clientID") ?? ""
-        clientSecret = Keychain.get("drive.clientSecret") ?? ""
-        isConnected = Keychain.get("drive.refreshToken") != nil
+        // The developer-entered secret is only needed without an embedded client.
+        clientSecret = DriveClientConfig.bundled == nil ? (Keychain.get("drive.clientSecret") ?? "") : ""
+        if let stored = UserDefaults.standard.object(forKey: "drive.connected") as? Bool {
+            isConnected = stored
+        } else {
+            // One-time migration from builds that kept this only in the Keychain.
+            isConnected = Keychain.get("drive.refreshToken") != nil
+            UserDefaults.standard.set(isConnected, forKey: "drive.connected")
+        }
     }
 
     /// True when the app ships with its own OAuth client — users then only
@@ -43,7 +54,11 @@ final class DriveService: ObservableObject {
     // MARK: Connect / disconnect
 
     func connect() {
-        guard !isConnecting else { return }
+        // A previous attempt whose browser tab was closed: abandon it and retry.
+        if isConnecting {
+            loopback?.cancel()
+            loopback = nil
+        }
         lastError = nil
         isConnecting = true
         Task { @MainActor in
@@ -92,6 +107,8 @@ final class DriveService: ObservableObject {
         ]
         NSWorkspace.shared.open(components.url!)
 
+        // Don't wait forever if the user closes the browser tab.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 300) { [weak server] in server?.cancel() }
         let code = try await server.waitForCode()
         loopback = nil
 
@@ -116,10 +133,21 @@ final class DriveService: ObservableObject {
     /// returns the share URL.
     func uploadAndLink(_ image: CGImage, filename: String) async throws -> String {
         let token = try await validAccessToken()
-        let folder = try await ensureFolder(token: token)
-        guard let png = ImageEncoding.pngData(image) else {
+        guard let png = await Task.detached(priority: .userInitiated, operation: { ImageWriter.pngData(image) }).value else {
             throw DriveError("Could not encode PNG")
         }
+        var folder = try await ensureFolder(token: token)
+        do {
+            return try await upload(png: png, filename: filename, folder: folder, token: token)
+        } catch let error as HTTPError where error.status == 404 || error.status == 400 {
+            // The cached "Snipost" folder was deleted — find/create it again once.
+            defaults.removeObject(forKey: "drive.folderID")
+            folder = try await ensureFolder(token: token)
+            return try await upload(png: png, filename: filename, folder: folder, token: token)
+        }
+    }
+
+    private func upload(png: Data, filename: String, folder: String, token: String) async throws -> String {
 
         let boundary = "snipost-\(UUID().uuidString)"
         let metadata = try JSONSerialization.data(withJSONObject: ["name": filename, "parents": [folder]])
@@ -274,7 +302,10 @@ final class OAuthLoopback {
     private var codeContinuation: CheckedContinuation<String, Error>?
 
     func start() async throws -> UInt16 {
-        let listener = try NWListener(using: .tcp, on: .any)
+        // Loopback only: nothing else on the network can reach the redirect.
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+        let listener = try NWListener(using: parameters)
         self.listener = listener
         return try await withCheckedThrowingContinuation { continuation in
             var resumed = false

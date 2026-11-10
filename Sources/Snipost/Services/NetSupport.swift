@@ -34,7 +34,8 @@ enum ImageEncoding {
     /// JPEG constrained to a byte budget (Bluesky blobs must stay under ~1 MB):
     /// walk down quality, then resolution, until it fits.
     static func jpegData(_ image: CGImage, maxBytes: Int) -> Data? {
-        var current = image
+        // JPEG has no alpha: flatten onto white so transparent areas aren't black.
+        var current = flattened(image) ?? image
         for _ in 0..<6 {
             for quality in [0.85, 0.7, 0.55] {
                 let rep = NSBitmapImageRep(cgImage: current)
@@ -47,6 +48,24 @@ enum ImageEncoding {
             current = smaller
         }
         return nil
+    }
+
+    static func flattened(_ image: CGImage) -> CGImage? {
+        switch image.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast: return image
+        default: break
+        }
+        guard let ctx = CGContext(
+            data: nil, width: image.width, height: image.height,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else { return nil }
+        let rect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(rect)
+        ctx.draw(image, in: rect)
+        return ctx.makeImage()
     }
 
     static func downscale(_ image: CGImage, factor: CGFloat) -> CGImage? {

@@ -41,6 +41,15 @@ struct Annotation: Identifiable, Equatable {
         self.color = color
     }
 
+    /// Same markup at another image scale (previews render at reduced size).
+    func scaled(by factor: CGFloat) -> Annotation {
+        guard factor != 1 else { return self }
+        var copy = self
+        copy.start = CGPoint(x: start.x * factor, y: start.y * factor)
+        copy.end = CGPoint(x: end.x * factor, y: end.y * factor)
+        return copy
+    }
+
     static let palette: [RGB] = [
         RGB(r: 0.93, g: 0.26, b: 0.21), // red
         RGB(r: 1.00, g: 0.58, b: 0.00), // orange
@@ -54,6 +63,8 @@ struct Annotation: Identifiable, Equatable {
 /// Bakes annotations onto the (filtered) screenshot before the beautify pass,
 /// so the compositor itself stays unchanged.
 enum AnnotationRenderer {
+    private static let ciContext = CIContext(options: [.cacheIntermediates: false])
+
     static func compose(_ base: CGImage, annotations: [Annotation]) -> CGImage {
         guard !annotations.isEmpty else { return base }
         let width = base.width
@@ -61,7 +72,7 @@ enum AnnotationRenderer {
         guard let ctx = CGContext(
             data: nil, width: width, height: height,
             bitsPerComponent: 8, bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
+            space: RenderColor.space(for: base),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return base }
 
@@ -165,7 +176,7 @@ enum AnnotationRenderer {
                 kCIInputScaleKey: scale,
                 kCIInputCenterKey: CIVector(x: ci.extent.midX, y: ci.extent.midY),
             ]).cropped(to: ci.extent)
-            guard let output = CIContext().createCGImage(pixellated, from: pixellated.extent) else { break }
+            guard let output = ciContext.createCGImage(pixellated, from: pixellated.extent) else { break }
             let drawRect = CGRect(
                 x: topDownRect.minX,
                 y: height - topDownRect.maxY,

@@ -74,6 +74,7 @@ enum ShareService {
     static func openWebIntent(_ intent: WebIntent, caption: String, image: CGImage) {
         Clipboard.copy(image)
         guard let url = intent.composeURL(text: caption) else { return }
+        let browser = NSWorkspace.shared.urlForApplication(toOpen: url)
         NSWorkspace.shared.open(url)
 
         if AXIsProcessTrusted() {
@@ -81,6 +82,13 @@ enum ShareService {
             Task { @MainActor in
                 // Give the browser time to load and focus the composer.
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
+                // Never paste into whatever else the user switched to.
+                guard let browser,
+                      NSWorkspace.shared.frontmostApplication?.bundleURL?.standardizedFileURL == browser.standardizedFileURL
+                else {
+                    Toast.show("Image copied — click the composer and press ⌘V")
+                    return
+                }
                 postPasteKeystroke()
                 Toast.show("Image attached — review and post (⌘V if it's missing)")
             }
