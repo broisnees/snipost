@@ -9,10 +9,13 @@ enum BeautifyRenderer {
         settings: BeautifySettings,
         autoColors: [RGB],
         backgroundImage: CGImage? = nil,
-        maxDimension: CGFloat? = nil
+        maxDimension: CGFloat? = nil,
+        logicalSize: CGSize? = nil
     ) -> CGImage? {
-        let imageWidth = CGFloat(image.width)
-        let imageHeight = CGFloat(image.height)
+        // Previews pass a downscaled image with the original's logical size,
+        // so layout (padding, radius, cursor) matches the full render exactly.
+        let imageWidth = logicalSize?.width ?? CGFloat(image.width)
+        let imageHeight = logicalSize?.height ?? CGFloat(image.height)
         let padding = settings.paddingFraction * max(imageWidth, imageHeight)
 
         // Canvas grows around the screenshot; aspect presets expand it further
@@ -36,7 +39,7 @@ enum BeautifyRenderer {
         let pixelHeight = Int((canvasHeight * scale).rounded())
         guard pixelWidth > 0, pixelHeight > 0 else { return nil }
 
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let colorSpace = RenderColor.space(for: image)
         guard let context = CGContext(
             data: nil,
             width: pixelWidth,
@@ -221,5 +224,16 @@ enum BeautifyRenderer {
         )
         CursorArt.draw(settings.cursor, in: context, tip: tip, size: size)
         context.restoreGState()
+    }
+}
+
+/// Keep the capture's own color space (Display P3 on most Macs) so saturated
+/// colors aren't clipped; fall back to sRGB for anything a bitmap can't use.
+enum RenderColor {
+    static let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
+
+    static func space(for image: CGImage) -> CGColorSpace {
+        guard let space = image.colorSpace, space.model == .rgb, space.supportsOutput else { return sRGB }
+        return space
     }
 }

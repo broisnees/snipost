@@ -31,9 +31,21 @@ enum Keychain {
         ]
         var result: AnyObject?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data
+              let data = result as? Data,
+              let value = String(data: data, encoding: .utf8)
         else { return nil }
-        return String(data: data, encoding: .utf8)
+        adoptIfNeeded(value, for: key)
+        return value
+    }
+
+    /// Items written by an earlier, differently-signed build make macOS ask
+    /// "allow Snipost to access…" on every read. Re-saving the item once from
+    /// this build makes it ours, so the prompt never comes back.
+    private static func adoptIfNeeded(_ value: String, for key: String) {
+        let marker = "keychain.adopted.\(key)"
+        guard !UserDefaults.standard.bool(forKey: marker) else { return }
+        set(value, for: key)
+        UserDefaults.standard.set(true, forKey: marker)
     }
 
     static func delete(_ key: String) {

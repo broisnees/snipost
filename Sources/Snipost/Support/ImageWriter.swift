@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -42,10 +43,35 @@ enum ImageWriter {
             nil
         ) else { return false }
 
-        let options = [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary
-        CGImageDestinationAddImage(destination, output, format.isLossy ? options : nil)
+        // Tag Retina DPI (144 on a 2× screen) so apps show the capture at its
+        // real on-screen size, crisp, instead of blown up 2×.
+        var options: [CFString: Any] = [
+            kCGImagePropertyDPIWidth: 72 * retinaScale,
+            kCGImagePropertyDPIHeight: 72 * retinaScale,
+        ]
+        if format.isLossy { options[kCGImageDestinationLossyCompressionQuality] = 0.92 }
+        CGImageDestinationAddImage(destination, output, options as CFDictionary)
         return CGImageDestinationFinalize(destination)
     }
+
+    /// Encodes PNG bytes with the Retina DPI tag (used for the clipboard).
+    static func pngData(_ image: CGImage) -> Data? {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil)
+        else { return nil }
+        let options: [CFString: Any] = [
+            kCGImagePropertyDPIWidth: 72 * retinaScale,
+            kCGImagePropertyDPIHeight: 72 * retinaScale,
+        ]
+        CGImageDestinationAddImage(destination, image, options as CFDictionary)
+        return CGImageDestinationFinalize(destination) ? data as Data : nil
+    }
+
+    /// Backing scale of the main display, read once (thread-safe afterwards).
+    static let retinaScale: CGFloat = {
+        if Thread.isMainThread { return NSScreen.main?.backingScaleFactor ?? 2 }
+        return DispatchQueue.main.sync { NSScreen.main?.backingScaleFactor ?? 2 }
+    }()
 
     private static func flattenedOnWhite(_ image: CGImage) -> CGImage? {
         guard let ctx = CGContext(

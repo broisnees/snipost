@@ -124,6 +124,8 @@ enum PendingFrozenFrame {
         stored = (image, displayID, Date())
     }
 
+    static func clear() { stored = nil }
+
     static func consume(displayID: CGDirectDisplayID) -> CGImage? {
         defer { stored = nil }
         guard let stored,
@@ -132,6 +134,10 @@ enum PendingFrozenFrame {
         else { return nil }
         return stored.image
     }
+}
+
+private final class WeakTapBox {
+    weak var tap: HotkeyTap?
 }
 
 /// Session-level keyboard tap on its own thread, so shortcuts fire even while
@@ -145,22 +151,27 @@ private final class HotkeyTap {
     init?(deliver: @escaping @MainActor (Int) -> Void) {
         self.deliver = deliver
 
-        let thread = Thread { [weak self] in
-            guard let self else { return }
-            guard let tap = CGEvent.tapCreate(
-                tap: .cgSessionEventTap,
-                place: .headInsertEventTap,
-                options: .defaultTap,
-                eventsOfInterest: CGEventMask(1 << CGEventType.keyDown.rawValue),
-                callback: { _, type, event, userInfo -> Unmanaged<CGEvent>? in
-                    guard let userInfo else { return Unmanaged.passUnretained(event) }
-                    let tapSelf = Unmanaged<HotkeyTap>.fromOpaque(userInfo).takeUnretainedValue()
-                    return tapSelf.handle(type: type, event: event)
-                },
-                userInfo: Unmanaged.passUnretained(self).toOpaque()
-            ) else { return }
+        // Create the tap synchronously so a failure (no Accessibility, or it
+        // was revoked) returns nil and the Carbon fallback takes over instead
+        // of leaving every hotkey dead.
+        let box = WeakTapBox()
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(1 << CGEventType.keyDown.rawValue),
+            callback: { _, type, event, userInfo -> Unmanaged<CGEvent>? in
+                guard let userInfo,
+                      let tapSelf = Unmanaged<WeakTapBox>.fromOpaque(userInfo).takeUnretainedValue().tap
+                else { return Unmanaged.passUnretained(event) }
+                return tapSelf.handle(type: type, event: event)
+            },
+            userInfo: Unmanaged.passRetained(box).toOpaque()
+        ) else { return nil }
+        tapPort = tap
+        box.tap = self
 
-            self.tapPort = tap
+        let thread = Thread {
             let source = CFMachPortCreateRunLoopSource(nil, tap, 0)
             CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
@@ -194,6 +205,8 @@ private final class HotkeyTap {
         guard let index = current.firstIndex(where: { $0.keyCode == keyCode && $0.flags == flags }) else {
             return Unmanaged.passUnretained(event)
         }
+        // Holding the combo: swallow key repeats instead of opening several overlays.
+        if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return nil }
         dispatchMatch(index)
         return nil // consume the shortcut
     }
