@@ -18,6 +18,19 @@ final class SelectionOverlayController {
 
     private static var current: SelectionOverlayController?
 
+    /// Last confirmed area selection (view coordinates), persisted for
+    /// "repeat last area".
+    static var lastArea: CGRect? {
+        get {
+            guard let string = UserDefaults.standard.string(forKey: "lastAreaRect") else { return nil }
+            let rect = NSRectFromString(string)
+            return rect.width > 4 && rect.height > 4 ? rect : nil
+        }
+        set {
+            UserDefaults.standard.set(newValue.map { NSStringFromRect($0) }, forKey: "lastAreaRect")
+        }
+    }
+
     private let window: OverlayWindow
     private let completion: @MainActor (Result) -> Void
 
@@ -26,6 +39,7 @@ final class SelectionOverlayController {
         screen: NSScreen,
         frozen: CGImage,
         windows: [SCWindow],
+        hint: String? = nil,
         completion: @escaping @MainActor (Result) -> Void
     ) {
         current?.finish(.cancelled)
@@ -34,6 +48,7 @@ final class SelectionOverlayController {
             screen: screen,
             frozen: frozen,
             windows: windows,
+            hint: hint,
             completion: completion
         )
     }
@@ -43,11 +58,13 @@ final class SelectionOverlayController {
         screen: NSScreen,
         frozen: CGImage,
         windows: [SCWindow],
+        hint: String?,
         completion: @escaping @MainActor (Result) -> Void
     ) {
         self.completion = completion
 
         let view = SelectionView(mode: mode, frozen: frozen, windows: windows, screen: screen)
+        view.hint = hint
         // Non-activating panel: taking key status without activating the app
         // keeps other apps' open menus/popovers alive so they can be snipped.
         window = OverlayWindow(
@@ -85,16 +102,20 @@ private final class OverlayWindow: NSPanel {
 }
 
 private final class SelectionView: NSView {
-    let mode: SelectionOverlayController.Mode
+    private(set) var mode: SelectionOverlayController.Mode
     let frozen: CGImage
     let windows: [SCWindow]
     let screenFrame: NSRect
 
     var onFinish: (@MainActor (SelectionOverlayController.Result) -> Void)?
+    var hint: String?
 
     private var dragStart: NSPoint?
     private var dragCurrent: NSPoint?
     private var hoverWindow: SCWindow?
+    /// A recalled/adjustable area (Return recalls the last one; arrows nudge,
+    /// ⇧+arrows resize, ⌥ = 10pt steps; Return captures).
+    private var pending: CGRect?
 
     init(mode: SelectionOverlayController.Mode, frozen: CGImage, windows: [SCWindow], screen: NSScreen) {
         self.mode = mode
@@ -146,15 +167,12 @@ private final class SelectionView: NSView {
             ctx.fillPath(using: .evenOdd)
 
             ctx.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.9))
-            ctx.setLineWidth(1.5)
-            ctx.stroke(selection.insetBy(dx: -0.75, dy: -0.75))
-
-            drawSizeLabel(for: selection, in: ctx)
+            ctx.setLineWidth(1)
+            ctx.stroke(selection.insetBy(dx: -0.5, dy: -0.5))
         } else {
             ctx.fill(bounds)
         }
-
-        drawHint()
+        // Deliberately nothing else: no hint pill, no size badge.
     }
 
     private func drawSizeLabel(for selection: CGRect, in ctx: CGContext) {
@@ -165,9 +183,9 @@ private final class SelectionView: NSView {
     }
 
     private func drawHint() {
-        let text = mode == .area
+        let text = hint ?? (mode == .area
             ? "Drag to select an area — Esc to cancel"
-            : "Click a window — Esc to cancel"
+            : "Click a window — Esc to cancel")
         drawBadge(text, at: CGPoint(x: bounds.midX, y: bounds.maxY - 48))
     }
 
@@ -195,7 +213,7 @@ private final class SelectionView: NSView {
     private func activeRect() -> CGRect? {
         switch mode {
         case .area:
-            guard let start = dragStart, let current = dragCurrent else { return nil }
+            guard let start = dragStart, let current = dragCurrent else { return pending }
             return CGRect(
                 x: min(start.x, current.x),
                 y: min(start.y, current.y),
@@ -228,6 +246,7 @@ private final class SelectionView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         switch mode {
         case .area:
+            pending = nil
             dragStart = point
             dragCurrent = point
             needsDisplay = true
@@ -249,7 +268,7 @@ private final class SelectionView: NSView {
         dragStart = nil
         dragCurrent = nil
         if rect.width > 4, rect.height > 4 {
-            onFinish?(.rect(rect))
+            finishArea(rect)
         } else {
             needsDisplay = true // ignore accidental clicks; keep selecting
         }
@@ -269,9 +288,53 @@ private final class SelectionView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { // Esc
+        switch event.keyCode {
+        case 53: // Esc
             onFinish?(.cancelled)
+        case 49: // Space: toggle area ⇄ window, like macOS
+            guard dragStart == nil, !windows.isEmpty else { return }
+            mode = mode == .area ? .window : .area
+            pending = nil
+            hoverWindow = nil
+            window?.invalidateCursorRects(for: self)
+            if mode == .window, let window {
+                updateHover(at: convert(window.mouseLocationOutsideOfEventStream, from: nil))
+            }
+            needsDisplay = true
+        case 36, 76: // Return / Enter
+            if mode == .window {
+                if let hoverWindow { onFinish?(.window(hoverWindow, viewRect(for: hoverWindow))) }
+            } else if let pending {
+                finishArea(pending)
+            } else if let last = SelectionOverlayController.lastArea {
+                pending = last.intersection(bounds)
+                needsDisplay = true
+            }
+        case 123, 124, 125, 126: // ← → ↓ ↑
+            guard mode == .area, dragStart == nil else { return }
+            if pending == nil { pending = SelectionOverlayController.lastArea?.intersection(bounds) }
+            guard var rect = pending else { return }
+            let step: CGFloat = event.modifierFlags.contains(.option) ? 10 : 1
+            let dx: CGFloat = event.keyCode == 123 ? -step : event.keyCode == 124 ? step : 0
+            let dy: CGFloat = event.keyCode == 125 ? -step : event.keyCode == 126 ? step : 0
+            if event.modifierFlags.contains(.shift) {
+                rect.size.width = max(8, rect.width + dx)
+                rect.size.height = max(8, rect.height + dy)
+                rect.origin.y -= dy // grow downward, keeping the top edge put
+            } else {
+                rect.origin.x += dx
+                rect.origin.y += dy
+            }
+            pending = rect.intersection(bounds)
+            needsDisplay = true
+        default:
+            break
         }
+    }
+
+    private func finishArea(_ rect: CGRect) {
+        SelectionOverlayController.lastArea = rect
+        onFinish?(.rect(rect))
     }
 
     // Esc also arrives through the responder chain as cancelOperation.

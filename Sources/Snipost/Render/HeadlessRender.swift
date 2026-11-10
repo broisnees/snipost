@@ -89,30 +89,33 @@ enum HeadlessRender {
             exit(1)
         }
 
+        // Viewport frames with a sticky 60px header and 50px footer drawn
+        // over the scrolling content — the case that used to repeat bars.
+        let header = 60, footer = 50
         var frames: [CGImage] = []
         var offset = 0
         while offset + viewportHeight <= tallHeight {
-            if let frame = tall.cropping(to: CGRect(x: 0, y: offset, width: width, height: viewportHeight)) {
-                frames.append(frame)
+            if let frame = tall.cropping(to: CGRect(x: 0, y: offset, width: width, height: viewportHeight)),
+               let framed = overlayBars(frame, header: header, footer: footer) {
+                frames.append(framed)
             }
             offset += step
         }
 
-        var segments = [frames[0]]
-        var previous = frames[0]
+        var session = Stitcher.Session()
         var allCorrect = true
-        for frame in frames.dropFirst() {
-            let detected = Stitcher.newRowsCount(previous: previous, next: frame)
-            print("detected scroll offset: \(detected) (expected \(step))")
-            if detected != step { allCorrect = false }
-            if detected > 0,
-               let slice = frame.cropping(to: CGRect(x: 0, y: frame.height - detected, width: frame.width, height: detected)) {
-                segments.append(slice)
+        for (index, frame) in frames.enumerated() {
+            let result = session.add(frame)
+            switch result {
+            case .first: print("frame 0: first")
+            case .added(let rows):
+                print("frame \(index): +\(rows) rows (expected \(step))")
+                if rows != step { allCorrect = false }
+            case .unchanged: print("frame \(index): unchanged"); allCorrect = false
+            case .lost: print("frame \(index): LOST"); allCorrect = false
             }
-            previous = frame
         }
-
-        guard let stitched = Stitcher.stack(segments) else {
+        guard let stitched = session.render() else {
             fputs("snipost: stack failed\n", stderr)
             exit(1)
         }
@@ -120,6 +123,24 @@ enum HeadlessRender {
         print("stitched \(stitched.width)x\(stitched.height), expected \(width)x\(expectedHeight)")
         _ = ImageWriter.write(stitched, to: outputPath)
         print(allCorrect && stitched.height == expectedHeight ? "STITCH TEST PASSED" : "STITCH TEST FAILED")
+    }
+
+    private static func overlayBars(_ frame: CGImage, header: Int, footer: Int) -> CGImage? {
+        let w = frame.width, h = frame.height
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.draw(frame, in: CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.setFillColor(CGColor(red: 0.1, green: 0.1, blue: 0.14, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: h - header, width: w, height: header)) // top (y-up)
+        ctx.setFillColor(CGColor(red: 0.2, green: 0.5, blue: 0.9, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: footer))
+        // Some texture so the bars aren't "flat" rows.
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(CGRect(x: 40, y: h - header + 20, width: 200, height: 18))
+        ctx.fill(CGRect(x: 60, y: 16, width: 160, height: 16))
+        return ctx.makeImage()
     }
 
     private static func makeTallContent(width: Int, height: Int) -> CGImage? {
@@ -139,6 +160,7 @@ enum HeadlessRender {
         var y: CGFloat = 20
         var index = 0
         while y < h - 40 {
+            if y > 900 && y < 1250 { y += 34; index += 1; continue } // blank gap
             let hue = CGFloat((index * 37) % 100) / 100
             let color = NSColor(hue: hue, saturation: 0.55, brightness: 0.8, alpha: 1)
             let indent = CGFloat((index * 53) % 180)
